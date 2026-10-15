@@ -1,0 +1,30 @@
+{
+  "name": "@pm/mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server exposing pm-tool projects, items, workflows and views to agents (stdio or Streamable HTTP). Talks to @pm/api over HTTP with an API key.",
+  "main": "./dist/server.js",
+  "bin": {
+    "pm-mcp": "./dist/server.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/server.ts",
+    "start": "node dist/server.js",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@pm/core": "workspace:*",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.23.15",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
+  }
+}

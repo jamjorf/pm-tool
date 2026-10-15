@@ -5,7 +5,12 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -13,11 +18,14 @@
     "lint": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@pm/core": "workspace:*"
+    "@pm/core": "workspace:*",
+    "nodemailer": "^7.0.13"
   },
   "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/nodemailer": "^6.4.24",
+    "fastify": "^5.12.7",
     "typescript": "^5.6.3",
-    "vitest": "^2.1.8",
-    "@types/node": "^22.10.2"
+    "vitest": "^2.1.8"
   }
 }
