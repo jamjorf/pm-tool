@@ -272,7 +272,7 @@ create table work_items (
   id            uuid primary key default gen_random_uuid(),
   project_id    uuid not null references projects(id),
   type_id       uuid not null references item_types(id),
-  number        integer not null,                       -- per project
+  number        integer not null,                       -- per project; filled by trigger when omitted
   key           text not null unique,                   -- "RATES-12" (denormalized for search/links)
   title         text not null check (length(title) between 1 and 500),
   description   text not null default '',               -- markdown
@@ -325,11 +325,9 @@ begin
   new.key := pkey || '-' || new.number;
   return new;
 end $$;
-alter table work_items alter column number drop not null; -- trigger fills it
+-- BEFORE ROW triggers run before NOT NULL/UNIQUE checks, so the trigger may fill `number`.
 create trigger assign_item_number before insert on work_items
   for each row execute function trg_assign_item_number();
-alter table work_items add constraint work_items_number_not_null check (number is not null) not valid;
-alter table work_items validate constraint work_items_number_not_null;
 
 -- Validate `fields` JSONB against item_types.field_defs (shape + required).
 -- Deep validation (option membership, user existence) happens in @pm/core.
