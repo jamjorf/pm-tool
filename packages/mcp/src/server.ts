@@ -8,6 +8,11 @@
 // Env: API_URL (default http://localhost:3001), PM_API_KEY, MCP_TRANSPORT, MCP_PORT, MCP_HOST.
 // ============================================================================
 import http from 'node:http';
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
+for (const f of [resolve(process.cwd(), '.env'), resolve(process.cwd(), '../../.env')]) {
+  if (existsSync(f)) { try { process.loadEnvFile(f); } catch { /* ignore */ } break; }
+}
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { PmClient } from './client.js';

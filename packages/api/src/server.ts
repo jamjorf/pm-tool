@@ -1,3 +1,5 @@
+import { loadDotEnv } from './env.js';
+loadDotEnv();
 import { buildApp } from './app.js';
 import { startWorkers } from './workers.js';
 

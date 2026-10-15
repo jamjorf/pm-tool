@@ -1,7 +1,14 @@
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 import postgres, { type Sql } from 'postgres';
 import { pathToFileURL } from 'node:url';
 
 export const DEFAULT_DATABASE_URL = 'postgres://postgres:postgres@127.0.0.1:5432/pmtool';
+
+// Honour a repo-root .env when present (Node 22 built-in; existing env vars win).
+for (const f of [resolve(process.cwd(), '.env'), resolve(process.cwd(), '../../.env')]) {
+  if (existsSync(f)) { try { process.loadEnvFile(f); } catch { /* ignore */ } break; }
+}
 
 /** DATABASE_URL from the environment, else the local docker-compose default. */
 export function databaseUrl(): string {
