@@ -4,6 +4,7 @@ export * from './mutations.js';
 export * from './workflow/types.js';
 export * from './permissions/types.js';
 // Implementations (added by the core package build-out):
+export * from './query/common.js';
 export * from './query/compile.js';
 export * from './query/evaluate.js';
 export * from './workflow/engine.js';

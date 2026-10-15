@@ -1,0 +1,68 @@
+# ADR-007: Sync is Replicache-style push/pull with a global version cookie
+
+**Status:** accepted · **Date:** 2026-10
+
+## Context
+
+The UX requirement is instant navigation on local data with optimistic
+writes, which implies a local store in the browser and a sync protocol. The
+server must remain the authority for every write (guards, effects, activity
+rows, notifications, webhooks). Candidate approaches: Replicache (client
+library with a documented push/pull protocol the server implements),
+ElectricSQL / PowerSync (Postgres replication to the client), Zero
+(query-driven sync service), or hand-rolled polling.
+
+## Decision
+
+Replicache (`replicache` v15) on the client; the server implements the
+protocol in `@pm/api`:
+
+* `POST /sync/push`: per mutation, in one transaction, replay through the
+  same `applyMutation()` the REST API uses; idempotent on mutation id, strict
+  ordering, errors logged and surfaced as a `mutation_rejected` notification
+  while the mutation is still marked applied.
+* `POST /sync/pull`: **global version strategy**. Every synced table has a
+  `version` column stamped from `sync_version_seq` by trigger; the cookie is
+  the max version seen; a pull returns rows with `version > cookie` as
+  `put` (visible, not deleted) or `del`. `deleted_at` tombstones make deletes
+  syncable; visibility changes that can hide unchanged rows set
+  `resync_required` and trigger a `clear` + full snapshot.
+* `GET /sync/poke`: SSE from an in-process emitter.
+* Every writing transaction takes `pg_advisory_xact_lock(42)` so version order
+  equals commit order (otherwise a client could skip a row whose lower version
+  committed later).
+
+The client's mutators are generated from the same `MutationArgs` and mirror
+the server's logic (including running the workflow engine) for optimistic
+updates.
+
+## Consequences
+
+* (+) One write path for everything (web, REST, MCP, integrations); the
+  optimistic client cannot drift from the server's vocabulary.
+* (+) No extra infrastructure: the protocol is three HTTP routes and two
+  bookkeeping tables.
+* (+) Offline works; per-client ordering is guaranteed by the protocol.
+* (+) Visibility is computed with the same SQL functions as every other read.
+* (−) Writers are serialised by the advisory lock. Acceptable at firm scale
+  (tens of writes/s); the signal to move on is push p95 > ~500 ms.
+* (−) Full snapshots on visibility changes; frequent membership churn means
+  frequent resyncs.
+* (−) The in-memory poke emitter is single-process; a second process needs
+  Postgres `LISTEN/NOTIFY`.
+* Migration path (no client change): Replicache's row-versioning strategy
+  (per-client-group client view records) removes the global lock and makes
+  visibility changes incremental.
+
+## Alternatives considered
+
+* **ElectricSQL / PowerSync.** Replicate Postgres to the client: strong reads,
+  but writes still need a custom path and the shape/permission rules would
+  duplicate `can_view_item()`; adds a sync service.
+* **Zero.** Query-driven partial sync is attractive for very large datasets;
+  at this size the whole visible set fits locally and a single cookie is
+  simpler to reason about and audit.
+* **Polling REST + client cache.** No optimistic writes without reinventing
+  the mutation log; no offline.
+* **WebSockets with custom protocol.** More code, no library-backed
+  guarantees on ordering and idempotency.

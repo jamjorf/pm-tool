@@ -24,6 +24,8 @@ export interface Actor {
   isService?: boolean;
   /** API key scopes; undefined for session users */
   scopes?: string[];
+  /** users.is_active; undefined is treated as active */
+  isActive?: boolean;
 }
 
 export interface ProjectCtx { id: string; visibility: ProjectVisibility; }
