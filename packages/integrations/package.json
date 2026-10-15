@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "description": "Slack, GitHub and email integrations for pm-tool: inbound Fastify routes + outbound senders and notification rendering. Pure library (no DB driver).",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -20,6 +21,14 @@
   "dependencies": {
     "@pm/core": "workspace:*",
     "nodemailer": "^7.0.13"
+  },
+  "peerDependencies": {
+    "fastify": "^5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "fastify": {
+      "optional": false
+    }
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
