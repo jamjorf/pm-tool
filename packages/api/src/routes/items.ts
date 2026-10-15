@@ -135,9 +135,9 @@ export async function itemRoutes(app: FastifyInstance) {
       assignee_id: body.assignee_id, start_date: body.start_date, due_date: body.due_date, estimate: body.estimate, fields: body.fields,
       label_ids: label_ids.length ? label_ids : undefined, parent_id, confidential: body.confidential,
     };
-    const item = await app.mutateFor(request, { name: 'createItem', args: args as any });
+    const item = (await app.mutateFor(request, { name: 'createItem', args: args as any })) as Row;
     reply.code(201);
-    return item;
+    return (await itemView(db, item.id as string)) ?? item;
   });
 
   // ---- bulk -----------------------------------------------------------------
@@ -193,7 +193,8 @@ export async function itemRoutes(app: FastifyInstance) {
   app.patch('/items/:key', async (request) => {
     const id = await visibleItemId(app, request);
     const patch = parse(ItemPatch, request.body);
-    return app.mutateFor(request, { name: 'updateItem', args: { id, patch } });
+    const updated = (await app.mutateFor(request, { name: 'updateItem', args: { id, patch } })) as Row;
+    return (await itemView(db, id)) ?? updated;
   });
 
   app.delete('/items/:key', async (request) => {
@@ -204,7 +205,8 @@ export async function itemRoutes(app: FastifyInstance) {
 
   app.post('/items/:key/restore', async (request) => {
     const id = await visibleItemId(app, request, { includeDeleted: true });
-    return app.mutateFor(request, { name: 'restoreItem', args: { id } });
+    const restored = (await app.mutateFor(request, { name: 'restoreItem', args: { id } })) as Row;
+    return (await itemView(db, id)) ?? restored;
   });
 
   // ---- transitions ----------------------------------------------------------
@@ -217,7 +219,8 @@ export async function itemRoutes(app: FastifyInstance) {
   app.post('/items/:key/transitions/:transitionKey', async (request) => {
     const id = await visibleItemId(app, request);
     const body = parse(z.object({ comment: z.string().optional() }), request.body);
-    return app.mutateFor(request, { name: 'transitionItem', args: { id, transition_key: paramsOf(request).transitionKey!, comment: body.comment } });
+    const transitioned = (await app.mutateFor(request, { name: 'transitionItem', args: { id, transition_key: paramsOf(request).transitionKey!, comment: body.comment } })) as Row;
+    return (await itemView(db, id)) ?? transitioned;
   });
 
   // ---- activity / comments --------------------------------------------------
