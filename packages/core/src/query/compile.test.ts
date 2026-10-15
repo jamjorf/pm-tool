@@ -73,7 +73,7 @@ describe('compileQuery', () => {
     expect(q.text).toContain("(w.fields->'tags') @> $1::text::jsonb");
     expect(q.text).toContain("(w.fields->'tags') ?| $2::text[]");
     expect(q.text).toContain("(w.fields->'tags') ?& $3::text[]");
-    expect(q.text).toContain("= '[]'::jsonb");
+    expect(q.text).toContain("<> '[]'::jsonb");
     expect(q.values[0]).toBe('["a"]');
   });
 

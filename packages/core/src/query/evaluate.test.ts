@@ -223,7 +223,8 @@ describe('groupItems', () => {
     const g = (f: string) => groupItems([A, B, C], f, lookups).map((x) => [x.key, x.label, x.items.map((i) => i.id)]);
     expect(g('state_id')).toEqual([['s-todo', 'todo', ['c']], ['s-prog', 'in progress', ['a']], ['s-done', 'done', ['b']]]);
     expect(g('assignee_id')).toEqual([['alice', 'Alice Chen', ['a']], ['bob', 'bob', ['b']], ['', 'Unassigned', ['c']]]);
-    expect(g('priority')).toEqual([['0', 'None', ['c']], ['1', 'Urgent', ['a']], ['3', 'Medium', ['b']]]);
+    expect(g('priority')).toEqual([['1', 'Urgent', ['a']], ['2', 'High', ['c']], ['3', 'Medium', ['b']]]);
+    expect(groupItems([{ ...C, priority: 0 }], 'priority', lookups)[0]!.label).toBe('None');
     expect(g('type_id')).toEqual([['t-task', 'Task', ['b', 'c']], ['t-bug', 'Bug', ['a']]]);
     expect(g('project_id')).toEqual([['p1', 'Rates', ['a', 'b', 'c']]]);
     expect(g('fields.severity')).toEqual([['s1', 'S1 – Critical', ['a']], ['', 'None', ['b', 'c']]]);

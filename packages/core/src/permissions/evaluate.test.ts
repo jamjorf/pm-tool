@@ -31,8 +31,11 @@ describe('can', () => {
     for (const a of ['workflow.manage', 'user.manage', 'project.edit', 'item.delete', 'comment.edit_any'] as Action[]) {
       expect(permissions.can(owner, a, { project: priv })).toBe(true);
       expect(permissions.can(admin, a, { project: priv })).toBe(true);
-      expect(permissions.can(member, a === 'project.edit' || a === 'item.delete' || a === 'comment.edit_any' ? 'item.view' : a, { project: firm })).toBe(a === 'item.view' ? true : false);
     }
+    for (const a of ['workflow.manage', 'user.manage', 'project.edit', 'comment.edit_any'] as Action[]) {
+      expect(permissions.can(member, a, { project: firm })).toBe(false);
+    }
+    expect(permissions.can(member, 'item.delete', { project: firm })).toBe(true); // editor-level
     expect(permissions.can(projAdmin, 'workflow.manage')).toBe(false);
   });
   it('role lattice per action', () => {

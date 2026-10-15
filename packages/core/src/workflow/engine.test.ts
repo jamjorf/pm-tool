@@ -20,6 +20,7 @@ const def: WorkflowDefinition = {
     tr('t5', 'restore', 'cancel', 'todo', [], [{ type: 'set_field', field: 'canceled_at', value: null }], 6),
     tr('t6', 'approve', 'prog', 'done', [{ type: 'field_equals', field: 'fields.approved', value: true }, { type: 'field_in', field: 'fields.severity', values: ['s1', 's2'] }, { type: 'require_assignee_is_actor' }, { type: 'require_label', label: 'Regulatory' }], [{ type: 'transition_parent_if', all_children_category: ['done'], to: 'done' }], 7),
     { ...tr('t7', 'old', null, 'done'), deleted_at: '2026-02-01T00:00:00Z' },
+    tr('t8', 'backlog', null, 'backlog', [], [{ type: 'set_field', field: 'completed_at', value: null }], 8),
   ],
 };
 
@@ -33,9 +34,9 @@ const ctx: GuardContext = { actorId: 'alice', actorRole: 'editor', now, openBloc
 
 describe('availableTransitions', () => {
   it('returns global + matching from-state transitions sorted, excluding deleted', () => {
-    expect(workflowEngine.availableTransitions(def, { state_id: 'backlog' }).map((t) => t.key)).toEqual(['triage', 'start', 'complete', 'cancel']);
-    expect(workflowEngine.availableTransitions(def, { state_id: 'prog' }).map((t) => t.key)).toEqual(['start', 'complete', 'cancel', 'approve']);
-    expect(workflowEngine.availableTransitions(def, { state_id: 'cancel' }).map((t) => t.key)).toEqual(['start', 'complete', 'cancel', 'restore']);
+    expect(workflowEngine.availableTransitions(def, { state_id: 'backlog' }).map((t) => t.key)).toEqual(['triage', 'start', 'complete', 'cancel', 'backlog']);
+    expect(workflowEngine.availableTransitions(def, { state_id: 'prog' }).map((t) => t.key)).toEqual(['start', 'complete', 'cancel', 'approve', 'backlog']);
+    expect(workflowEngine.availableTransitions(def, { state_id: 'cancel' }).map((t) => t.key)).toEqual(['start', 'complete', 'cancel', 'restore', 'backlog']);
   });
 });
 

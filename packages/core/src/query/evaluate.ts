@@ -315,9 +315,18 @@ function chain(cmps: Comparator[]): Comparator {
   };
 }
 
+/** Reject sort keys the SQL compiler would reject (unknown or non-sortable fields) before comparing anything. */
+function validateSort(sort: SortSpec[]): void {
+  for (const s of sort) {
+    const r = resolveField(s.field);
+    if (r.kind === 'builtin' && !r.sortable) throw new Error(`field ${s.field} is not sortable`);
+  }
+}
+
 /** Stable multi-key sort; nulls last unless the key says otherwise; final tiebreaker is the item id (as in SQL). */
 export function sortItems(items: ItemRow[], sort: SortSpec[] | undefined, lookups: EvalLookups): ItemRow[] {
   const keys = sort && sort.length ? sort : DEFAULT_SORT;
+  validateSort(keys);
   const cmp = chain(keys.map((s) => comparatorFor(s, lookups)));
   return [...items].sort(cmp);
 }
@@ -387,6 +396,8 @@ export function groupItems(items: ItemRow[], groupBy: FieldRef | null | undefine
 export function runSpec(spec: QuerySpec, items: ItemRow[], ctx: QueryContext, lookups: EvalLookups): { items: ItemRow[]; groups: { key: string; label: string; items: ItemRow[] }[] | null } {
   const filtered = items.filter((it) => matchesSpec(spec, it, ctx, lookups));
   const keys = spec.sort && spec.sort.length ? spec.sort : DEFAULT_SORT;
+  validateSort(keys);
+  if (spec.group_by === 'labels' || spec.group_by === 'search') throw new Error(`cannot group by ${spec.group_by}`);
   const cmps = keys.map((s) => comparatorFor(s, lookups));
   if (spec.group_by) cmps.unshift(groupComparator(spec.group_by, lookups));
   let sorted = [...filtered].sort(chain(cmps));
