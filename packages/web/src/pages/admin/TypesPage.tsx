@@ -31,7 +31,7 @@ export function TypesPage() {
     for (const d of draft.field_defs) if (!/^[a-z][a-z0-9_]*$/.test(d.key)) { toast({ kind: 'error', title: `Invalid field key "${d.key}"`, body: 'Use lowercase letters, digits and underscores.' }); return; }
     setSaving(true);
     try {
-      await api.upsertType(draft.key, draft);
+      await api.upsertType(draft.key, { ...draft, workflow: workflows.find((w) => w.id === draft.workflow_id)?.key });
       await rep.mutate.upsertItemType(draft).catch(() => undefined);
       toast({ kind: 'success', title: 'Type saved' });
       setSelected(draft.id);

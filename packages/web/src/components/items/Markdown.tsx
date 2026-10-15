@@ -1,5 +1,5 @@
 import { memo } from 'react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import { Link } from 'react-router-dom';
 
 const KEY_RE = /(^|[\s(])([A-Z][A-Z0-9]{1,9}-\d+)(?=[\s).,;:!?]|$)/g;
@@ -14,9 +14,10 @@ export const Markdown = memo(function Markdown({ text, className }: { text: stri
   return (
     <div className={'prose text-sm ' + (className ?? '')}>
       <ReactMarkdown
+        urlTransform={(url) => (url.startsWith('user:') ? url : defaultUrlTransform(url))}
         components={{
           a: ({ href, children }) => {
-            if (href?.startsWith('user:')) return <span className="mention">@{children}</span>;
+            if (href?.startsWith('user:')) return <span className="mention">{children}</span>;
             if (href?.startsWith('/')) return <Link to={href}>{children}</Link>;
             return (
               <a href={href} target="_blank" rel="noreferrer">

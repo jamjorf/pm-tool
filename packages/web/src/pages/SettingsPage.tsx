@@ -28,7 +28,7 @@ export function SettingsPage() {
   const [newKey, setNewKey] = useState('');
   const [created, setCreated] = useState<string | null>(null);
   const [theme, setTheme] = useState<Theme>(getTheme());
-  useEffect(() => { api.listApiKeys().then((r) => setKeys(Array.isArray(r) ? r : (r as { keys?: ApiKeyRow[] }).keys ?? [])).catch(() => setKeys([])); }, []);
+  useEffect(() => { api.listApiKeys().then(setKeys).catch(() => setKeys([])); }, []);
 
   const pref = (ch: NotifyChannel) => preferences.find((p) => p.channel === ch);
   return (
@@ -62,7 +62,7 @@ export function SettingsPage() {
         <p className="mb-2 text-xs text-fg-muted">Use with <code>Authorization: Bearer pm_…</code> for the REST API and the MCP server.</p>
         <div className="mb-2 flex gap-2">
           <Input placeholder="Key name (e.g. MCP on my laptop)" value={newKey} onChange={(e) => setNewKey(e.target.value)} className="max-w-xs" />
-          <Button variant="primary" disabled={!newKey.trim()} onClick={() => void api.createApiKey(newKey.trim()).then((r) => { setCreated(r.key); setNewKey(''); return api.listApiKeys().then((k) => setKeys(Array.isArray(k) ? k : [])); })}>Create key</Button>
+          <Button variant="primary" disabled={!newKey.trim()} onClick={() => void api.createApiKey(newKey.trim()).then((r) => { setCreated(r.key); setNewKey(''); return api.listApiKeys().then(setKeys); })}>Create key</Button>
         </div>
         {created && (
           <div className="mb-3 flex items-center gap-2 rounded-md border border-ok/40 bg-ok-soft px-3 py-2 text-sm">

@@ -2,19 +2,21 @@ import { forwardRef, type InputHTMLAttributes, type SelectHTMLAttributes, type T
 import { cn } from '../../lib/util';
 
 const base =
-  'w-full rounded-md border border-border bg-bg px-2.5 text-sm text-fg placeholder:text-fg-faint focus:border-accent focus:outline-none disabled:opacity-50';
+  'rounded-md border border-border bg-bg px-2.5 text-sm text-fg placeholder:text-fg-faint focus:border-accent focus:outline-none disabled:opacity-50';
+/** Default to full width unless the caller passes an explicit `w-*` class. */
+const width = (className?: string) => (className && /(^|\s)(w-|max-w-|flex-1|min-w-)/.test(className) ? '' : 'w-full');
 
 export const Input = forwardRef<HTMLInputElement, InputHTMLAttributes<HTMLInputElement>>(function Input({ className, ...rest }, ref) {
-  return <input ref={ref} className={cn(base, 'h-8', className)} {...rest} />;
+  return <input ref={ref} className={cn(base, width(className), 'h-8', className)} {...rest} />;
 });
 
 export const Textarea = forwardRef<HTMLTextAreaElement, TextareaHTMLAttributes<HTMLTextAreaElement>>(function Textarea({ className, ...rest }, ref) {
-  return <textarea ref={ref} className={cn(base, 'min-h-[80px] py-1.5 leading-relaxed', className)} {...rest} />;
+  return <textarea ref={ref} className={cn(base, width(className), 'min-h-[80px] py-1.5 leading-relaxed', className)} {...rest} />;
 });
 
 export const Select = forwardRef<HTMLSelectElement, SelectHTMLAttributes<HTMLSelectElement>>(function Select({ className, children, ...rest }, ref) {
   return (
-    <select ref={ref} className={cn(base, 'h-8 appearance-none pr-7 bg-no-repeat', className)} style={{ backgroundImage: 'none' }} {...rest}>
+    <select ref={ref} className={cn(base, width(className), 'h-8 appearance-none pr-7 bg-no-repeat', className)} style={{ backgroundImage: 'none' }} {...rest}>
       {children}
     </select>
   );

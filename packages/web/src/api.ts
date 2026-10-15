@@ -26,7 +26,7 @@ export async function request<T>(path: string, opts: Opts = {}): Promise<T> {
   try {
     res = await fetch(path, {
       method: opts.method ?? (opts.body !== undefined ? 'POST' : 'GET'),
-      headers: opts.body !== undefined ? { 'content-type': 'application/json' } : undefined,
+      headers: { 'x-pm-source': 'app', ...(opts.body !== undefined ? { 'content-type': 'application/json' } : {}) },
       body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
       credentials: 'same-origin',
       signal: opts.signal,
@@ -47,6 +47,12 @@ export async function request<T>(path: string, opts: Opts = {}): Promise<T> {
   }
   if (!res.ok) {
     const e = (json as { error?: { code?: string; message?: string; details?: unknown } } | undefined)?.error;
+    if (!e && res.status >= 500) {
+      // The dev proxy answers 5xx with a plain body when the API is down: treat it as unreachable.
+      const err = new ApiError(0, 'network', 'Network error: API unreachable');
+      if (!opts.silent) toastError('API unreachable', 'Changes are kept locally and will sync when the server is back.');
+      throw err;
+    }
     const err = new ApiError(res.status, e?.code ?? 'internal', e?.message ?? `${res.status} ${res.statusText}`, e?.details);
     if (!opts.silent && res.status !== 401) toastError(err.message, err.code !== 'internal' ? err.code : undefined);
     throw err;
@@ -114,7 +120,7 @@ export const api = {
   me: (silent = true) => request<Me>('/me', { silent }),
 
   // ---- api keys ----
-  listApiKeys: () => request<ApiKeyRow[]>('/me/api-keys'),
+  listApiKeys: () => request<{ keys: ApiKeyRow[] } | ApiKeyRow[]>('/me/api-keys').then((r) => unwrapList<ApiKeyRow>(r, 'keys')),
   createApiKey: (name: string, scopes?: string[]) => request<{ id: string; key: string }>('/me/api-keys', { body: { name, scopes } }),
   deleteApiKey: (id: string) => request<void>(`/me/api-keys/${id}`, { method: 'DELETE' }),
 
@@ -125,7 +131,7 @@ export const api = {
       { silent: true, signal },
     ),
   activity: (itemKey: string, before?: number, limit = 100) =>
-    request<{ events: ActivityEvent[] } | ActivityEvent[]>(
+    request<{ events: ActivityEvent[]; cursor?: number | null } | ActivityEvent[]>(
       `/api/v1/items/${encodeURIComponent(itemKey)}/activity?limit=${limit}${before ? `&before=${before}` : ''}`,
       { silent: true },
     ),
@@ -133,8 +139,16 @@ export const api = {
   runView: (id: string) => request<unknown>(`/api/v1/views/${id}/run`, { method: 'POST', body: {} }),
 
   // ---- admin ----
-  upsertWorkflow: (key: string, args: MutationArgsOf<'upsertWorkflow'>) => request<unknown>(`/api/v1/workflows/${encodeURIComponent(key)}`, { method: 'PUT', body: args }),
-  upsertType: (key: string, args: MutationArgsOf<'upsertItemType'>) => request<ItemType>(`/api/v1/types/${encodeURIComponent(key)}`, { method: 'PUT', body: args }),
+  /** Body = upsertWorkflow args; transitions also carry `from`/`to` state keys (the API accepts either). */
+  upsertWorkflow: (key: string, args: MutationArgsOf<'upsertWorkflow'>) => {
+    const keyOf = (id: string | null) => (id ? (args.states.find((s) => s.id === id)?.key ?? null) : null);
+    const body = { ...args, transitions: args.transitions.map((t) => ({ ...t, from: keyOf(t.from_state_id), to: keyOf(t.to_state_id) })) };
+    return request<unknown>(`/api/v1/workflows/${encodeURIComponent(key)}`, { method: 'PUT', body });
+  },
+  /** Body = upsertItemType args plus `workflow` (key) when known; `force` drops a field still in use. */
+  upsertType: (key: string, args: MutationArgsOf<'upsertItemType'> & { workflow?: string }, force = false) =>
+    request<ItemType>(`/api/v1/types/${encodeURIComponent(key)}${force ? '?force=1' : ''}`, { method: 'PUT', body: args }),
+  patchMe: (patch: { name?: string; avatar_url?: string | null; settings?: Record<string, unknown> }) => request<User>('/me', { method: 'PATCH', body: patch }),
   listUsers: () => request<User[] | { users: User[] }>('/api/v1/users'),
   patchUser: (id: string, patch: { firm_role?: string; is_active?: boolean }) => request<User>(`/api/v1/users/${id}`, { method: 'PATCH', body: patch }),
   listWebhooks: () => request<WebhookEndpoint[] | { webhooks: WebhookEndpoint[] }>('/api/v1/webhooks'),

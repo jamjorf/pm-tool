@@ -145,11 +145,11 @@ export function TypeIcon({ type, size = 14 }: { type: ItemType | undefined; size
   );
 }
 
-export function DueDateLabel({ date, done }: { date: string | null; done?: boolean }) {
+export function DueDateLabel({ date, done, plain }: { date: string | null; done?: boolean; plain?: boolean }) {
   if (!date) return <span className="text-fg-faint">—</span>;
   const d = parseISO(date);
-  const overdue = !done && isBefore(d, startOfDay(new Date()));
-  const soon = !done && !overdue && isBefore(d, addDays(startOfDay(new Date()), 3));
+  const overdue = !plain && !done && isBefore(d, startOfDay(new Date()));
+  const soon = !plain && !done && !overdue && isBefore(d, addDays(startOfDay(new Date()), 3));
   return <span className={cn(overdue && 'text-danger', soon && 'text-warn')}>{format(d, d.getFullYear() === new Date().getFullYear() ? 'd MMM' : 'd MMM yyyy')}</span>;
 }
 
@@ -238,7 +238,7 @@ export function DueDateChip({ item, ids, compact, field = 'due_date' }: { item?:
     <>
       <Chip onClick={p.show} compact={compact} title={field === 'due_date' ? 'Due date' : 'Start date'}>
         <Calendar size={14} className="text-fg-faint" />
-        {value ? <DueDateLabel date={value} done={done} /> : <span className="text-fg-faint">{ids && !item ? 'Due date' : '—'}</span>}
+        {value ? <DueDateLabel date={value} done={done} plain={field !== 'due_date'} /> : <span className="text-fg-faint">{ids && !item ? 'Due date' : '—'}</span>}
       </Chip>
       <DatePicker open={p.open} onClose={p.close} anchor={p.anchor} value={value} label={field === 'due_date' ? 'Due date' : 'Start date'} onChange={(d) => (field === 'due_date' ? void a.setDueDate(targets, d) : void a.setStartDate(targets, d))} />
     </>

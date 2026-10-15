@@ -34,7 +34,8 @@ export function useGlobalShortcuts(): void {
           break;
         case 'new_item': {
           const p = projectKey ? projectByKey[projectKey.toUpperCase()] : undefined;
-          u.openQuickCreate(p ? { project_id: p.id } : {});
+          const openProject = u.openItemId ? itemsById[u.openItemId]?.project_id : undefined;
+          u.openQuickCreate(p ? { project_id: p.id } : openProject ? { project_id: openProject } : {});
           break;
         }
         case 'toggle_theme':
