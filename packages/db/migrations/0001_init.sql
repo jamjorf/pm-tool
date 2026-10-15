@@ -30,7 +30,7 @@ create extension if not exists pg_trgm;
 -- Every row in a synced table gets `version = nextval('sync_version_seq')` on
 -- insert/update via trigger. Clients pull `where version > :cookie`.
 -- Writers that participate in sync take `pg_advisory_xact_lock(42)` so that
--- version order == commit order (see docs/05-architecture.md#sync).
+-- version order == commit order (see docs/02-design.md, "Sync").
 create sequence if not exists sync_version_seq as bigint start 1;
 
 create or replace function trg_set_version() returns trigger
@@ -158,7 +158,7 @@ select install_sync_trigger('workflow_states');
 -- guards:  JSON array of guard specs evaluated by @pm/core workflow engine, e.g.
 --   [{"type":"require_field","field":"assignee_id"},
 --    {"type":"no_open_blockers"},
---    {"type":"children_in_category","category":"done"},
+--    {"type":"children_in_category","categories":["done","canceled"]},
 --    {"type":"require_role","roles":["admin","editor"]},
 --    {"type":"field_equals","field":"fields.approved","value":true}]
 -- effects: JSON array of side effects applied after the transition, e.g.
@@ -166,7 +166,7 @@ select install_sync_trigger('workflow_states');
 --    {"type":"set_field","field":"assignee_id","value":null},
 --    {"type":"notify","audience":["watchers"],"template":"state_changed"},
 --    {"type":"webhook","event":"item.transitioned"},
---    {"type":"transition_parent_if","all_children_category":"done","to":"done"}]
+--    {"type":"transition_parent_if","all_children_category":["done","canceled"],"to":"done"}]
 create table workflow_transitions (
   id            uuid primary key default gen_random_uuid(),
   workflow_id   uuid not null references workflows(id) on delete cascade,
@@ -284,7 +284,7 @@ create table work_items (
   due_date      date,
   estimate      numeric(10,2),                           -- points/hours; unit per project settings
   fields        jsonb not null default '{}'::jsonb check (jsonb_typeof(fields) = 'object'),
-  confidential  boolean not null default false,         -- visible to project admins + assignee + reporter only
+  confidential  boolean not null default false,         -- visible to project admins + assignee + reporter + creator only
   sort_order    double precision not null default 0,    -- manual ordering within a board column
   search        tsvector generated always as (
                   setweight(to_tsvector('english', coalesce(key, '')), 'A') ||

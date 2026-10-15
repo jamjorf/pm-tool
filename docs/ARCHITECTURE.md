@@ -210,7 +210,8 @@ POST   /integrations/email/inbound            provider-agnostic JSON {from, to, 
 
 `webhook_endpoints.event_kinds` filter on `EventKind` (`item.created`,
 `item.updated`, `item.transitioned`, `item.completed`, `item.deleted`,
-`comment.created`, `relation.added`, `relation.removed`, `project.*`).
+`item.restored`, `comment.created`, `comment.updated`, `comment.deleted`,
+`relation.added`, `relation.removed`, `project.created`, `project.updated`).
 A dispatcher loop in the API process (every 5s) delivers pending rows with
 headers `X-PM-Event`, `X-PM-Delivery`, `X-PM-Signature: sha256=<hmac(secret, body)>`,
 body `{ id, kind, created_at, actor:{id,name,kind}, project:{id,key,name},
