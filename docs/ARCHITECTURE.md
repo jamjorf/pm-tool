@@ -259,3 +259,20 @@ inserting. Email/Slack: `notification_deliveries` scheduled per
 * Keyboard: `j/k` move, `enter` open, `esc` close, `c` new, `e` edit title,
   `a` assign, `p` priority, `s` state, `l` label, `/` search, `g` then `i/p/n`
   go to inbox/projects/notifications, `?` cheatsheet.
+
+## Integrations contract
+
+`@pm/integrations` exports:
+
+```ts
+registerIntegrationRoutes(app: FastifyInstance, deps: IntegrationDeps): Promise<void>  // mounts /integrations/*
+sendSlackMessage(deps, { channel, text, blocks? }): Promise<void>
+sendEmail(deps, { to, subject, text, html? }): Promise<void>
+renderNotification(n: OutboundNotification): { subject: string; text: string; html: string; slackBlocks: unknown[] }
+renderDigest(items: OutboundNotification[]): { subject: string; text: string; html: string; slackBlocks: unknown[] }
+```
+
+`IntegrationDeps` is defined in `packages/integrations/src/deps.ts` and
+implemented by `packages/api/src/integrations.ts`. The API's notification
+delivery worker calls `renderNotification`/`renderDigest` and then
+`sendEmail`/`sendSlackMessage`.
