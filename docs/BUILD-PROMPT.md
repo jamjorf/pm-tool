@@ -529,11 +529,40 @@ core/web/mcp, `"types": ["node"]` for db/api) and a `vitest.config.ts`:
 }
 ```
 
-`packages/api/package.json` — name `@pm/api`, scripts `dev: tsx watch
-src/server.ts`, `start: node dist/server.js`, `build/typecheck/lint/test` as
-the others; dependencies: `@pm/core`, `@pm/integrations` (workspace), `fastify
-^5`, `@fastify/cookie`, `@fastify/cors`, `@fastify/rate-limit`, `postgres
-^3.4`, `zod ^3`; devDependencies: `tsx`, `typescript`, `vitest`, `@types/node`.
+`packages/api/package.json`:
+
+```json
+{
+  "name": "@pm/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/server.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/server.js",
+    "test": "vitest run",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.1.3",
+    "@fastify/cors": "^11.3.1",
+    "@pm/core": "workspace:*",
+    "@pm/integrations": "workspace:*",
+    "fastify": "^5.12.7",
+    "postgres": "^3.4.9",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.23.15",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
+  }
+}
+```
 
 ---
 
@@ -756,7 +785,8 @@ POST   /integrations/email/inbound            provider-agnostic JSON {from, to, 
 
 `webhook_endpoints.event_kinds` filter on `EventKind` (`item.created`,
 `item.updated`, `item.transitioned`, `item.completed`, `item.deleted`,
-`comment.created`, `relation.added`, `relation.removed`, `project.*`).
+`item.restored`, `comment.created`, `comment.updated`, `comment.deleted`,
+`relation.added`, `relation.removed`, `project.created`, `project.updated`).
 A dispatcher loop in the API process (every 5s) delivers pending rows with
 headers `X-PM-Event`, `X-PM-Delivery`, `X-PM-Signature: sha256=<hmac(secret, body)>`,
 body `{ id, kind, created_at, actor:{id,name,kind}, project:{id,key,name},
@@ -866,7 +896,7 @@ create extension if not exists pg_trgm;
 -- Every row in a synced table gets `version = nextval('sync_version_seq')` on
 -- insert/update via trigger. Clients pull `where version > :cookie`.
 -- Writers that participate in sync take `pg_advisory_xact_lock(42)` so that
--- version order == commit order (see docs/05-architecture.md#sync).
+-- version order == commit order (see docs/02-design.md, "Sync").
 create sequence if not exists sync_version_seq as bigint start 1;
 
 create or replace function trg_set_version() returns trigger
@@ -994,7 +1024,7 @@ select install_sync_trigger('workflow_states');
 -- guards:  JSON array of guard specs evaluated by @pm/core workflow engine, e.g.
 --   [{"type":"require_field","field":"assignee_id"},
 --    {"type":"no_open_blockers"},
---    {"type":"children_in_category","category":"done"},
+--    {"type":"children_in_category","categories":["done","canceled"]},
 --    {"type":"require_role","roles":["admin","editor"]},
 --    {"type":"field_equals","field":"fields.approved","value":true}]
 -- effects: JSON array of side effects applied after the transition, e.g.
@@ -1002,7 +1032,7 @@ select install_sync_trigger('workflow_states');
 --    {"type":"set_field","field":"assignee_id","value":null},
 --    {"type":"notify","audience":["watchers"],"template":"state_changed"},
 --    {"type":"webhook","event":"item.transitioned"},
---    {"type":"transition_parent_if","all_children_category":"done","to":"done"}]
+--    {"type":"transition_parent_if","all_children_category":["done","canceled"],"to":"done"}]
 create table workflow_transitions (
   id            uuid primary key default gen_random_uuid(),
   workflow_id   uuid not null references workflows(id) on delete cascade,
@@ -1120,7 +1150,7 @@ create table work_items (
   due_date      date,
   estimate      numeric(10,2),                           -- points/hours; unit per project settings
   fields        jsonb not null default '{}'::jsonb check (jsonb_typeof(fields) = 'object'),
-  confidential  boolean not null default false,         -- visible to project admins + assignee + reporter only
+  confidential  boolean not null default false,         -- visible to project admins + assignee + reporter + creator only
   sort_order    double precision not null default 0,    -- manual ordering within a board column
   search        tsvector generated always as (
                   setweight(to_tsvector('english', coalesce(key, '')), 'A') ||
@@ -1341,13 +1371,19 @@ create index relations_external_idx on relations(external_kind, (external_ref->>
 create unique index relations_single_parent_uq on relations(to_item_id) where type = 'parent_of' and deleted_at is null;
 select install_sync_trigger('relations');
 
--- Prevent cycles in hierarchy and blocking graphs.
+-- Prevent cycles in hierarchy and blocking graphs; reject reverse duplicates of symmetric edges.
 create or replace function trg_relations_no_cycle() returns trigger
 language plpgsql as $$
 declare rt relation_types%rowtype; found boolean;
 begin
   if new.to_item_id is null or new.deleted_at is not null then return new; end if;
   select * into rt from relation_types where key = new.type;
+  -- symmetric types (duplicates, relates_to): the reverse edge is the same edge
+  if rt.is_symmetric and exists (
+       select 1 from relations r where r.type = new.type and r.from_item_id = new.to_item_id
+         and r.to_item_id = new.from_item_id and r.deleted_at is null and r.id <> new.id) then
+    raise exception 'relation % between % and % already exists (symmetric)', new.type, new.to_item_id, new.from_item_id using errcode = '23505';
+  end if;
   if not (rt.is_hierarchy or rt.is_blocking) then return new; end if;
   -- is there already a path to_item -> ... -> from_item of the same type?
   with recursive walk(item_id, depth) as (
@@ -1654,6 +1690,7 @@ language sql stable as $$
               else null end
      from users u, projects p where u.id = p_user and p.id = p_project and u.deleted_at is null and p.deleted_at is null)
   )
+  from users u0 where u0.id = p_user and u0.is_active and u0.deleted_at is null
 $$;
 
 -- Can the user see this item? (membership/visibility + confidential flag)
@@ -2273,6 +2310,7 @@ export const BUILTIN_FIELDS: Record<string, { kind: 'text' | 'number' | 'bool' |
   created_at: { kind: 'datetime', label: 'Created', sortable: true },
   updated_at: { kind: 'datetime', label: 'Updated', sortable: true },
   completed_at: { kind: 'datetime', label: 'Completed', sortable: true },
+  canceled_at: { kind: 'datetime', label: 'Canceled', sortable: true },
   archived_at: { kind: 'datetime', label: 'Archived', sortable: true },
   'state.category': { kind: 'enum', label: 'State category', sortable: true },
   'state.key': { kind: 'text', label: 'State key', sortable: true },
