@@ -23,9 +23,9 @@ flowchart LR
     end
 
     subgraph Server["Single API process (packages/api, Fastify 5)"]
-        AUTH[auth: pm_session cookie · Bearer pm_key]
-        REST[REST /api/v1]
-        SYNC[/sync/push · /sync/pull · /sync/poke SSE/]
+        AUTH["auth: pm_session cookie · Bearer pm_key"]
+        REST["REST /api/v1"]
+        SYNC["/sync/push · /sync/pull · /sync/poke SSE"]
         MUT[applyMutation<br/>permissions → validateFields → workflowEngine → diff → activity_events]
         NOTIF[notification worker<br/>rules · collapse · digests · quiet hours]
         WH[webhook dispatcher<br/>every 5s · HMAC · backoff]
@@ -640,22 +640,22 @@ sequenceDiagram
     U->>B: drag RATES-12 from "Todo" to "In Progress"
     B->>B: target column = state in_progress → find transition to it (workflowEngine.availableTransitions)
     B->>R: mutate.transitionItem({id, transition_key:'start'})
-    R->>R: evaluate() with local GuardContext → patch {state_id, start_date}; optimistic put work_items/<id>
+    R->>R: evaluate() with local GuardContext → patch {state_id, start_date}, optimistic put work_items/…
     B-->>U: card is already in the new column (0 ms)
     R->>API: POST /sync/push {mutations:[{id: 57, name:'transitionItem', args}]}
-    API->>DB: BEGIN; select pg_advisory_xact_lock(42); check last_mutation_id = 56
+    API->>DB: BEGIN, select pg_advisory_xact_lock(42), check last_mutation_id = 56
     API->>M: applyMutation(tx, actor, transitionItem, {source:'app', txnId})
-    M->>DB: permissions.assert(item.transition); load item + workflow + item_open_blockers()
+    M->>DB: permissions.assert(item.transition), load item + workflow + item_open_blockers()
     M->>M: workflowEngine.evaluate → ok, patch, deferredEffects
     M->>DB: update work_items set state_id, start_date (version = nextval)
     M->>DB: insert activity_events ×2 (state_id, start_date) same txn_id
     M->>DB: upsert item_watchers; insert notifications (state_change → assignee if not actor)
     M->>DB: insert webhook_deliveries for endpoints matching item.transitioned
-    API->>DB: update sync_clients last_mutation_id = 57; COMMIT
+    API->>DB: update sync_clients last_mutation_id = 57, COMMIT
     API->>P: emit poke
-    P-->>R: event: poke
+    P-->>R: event poke
     R->>API: POST /sync/pull {cookie}
-    API-->>R: patch: put work_items/<id>, put notifications/<id>…
+    API-->>R: patch with put work_items/…, put notifications/…
     W->>DB: every 5s: pending deliveries
     W->>EXT: POST https://your-system/hook  X-PM-Signature: sha256=…
     N->>DB: notification_deliveries due (cadence immediate, outside quiet hours)
