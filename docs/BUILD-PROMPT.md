@@ -152,7 +152,9 @@ validation with zod 3, tests with vitest, build order `@pm/core` first then
   "description": "Firm-wide project management tool: generic work items, data-driven workflows, graph relations, append-only activity log, views as saved queries, local-first sync, MCP server.",
   "type": "module",
   "packageManager": "pnpm@10.28.0",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "build": "pnpm -r --filter './packages/*' run build",
     "typecheck": "pnpm -r --filter './packages/*' run typecheck",
@@ -170,6 +172,12 @@ validation with zod 3, tests with vitest, build order `@pm/core` first then
     "typescript": "^5.6.3",
     "vitest": "^2.1.8",
     "@types/node": "^22.10.2"
+  },
+  "pnpm": {
+    "overrides": {
+      "@types/react": "^18.3.0",
+      "@types/react-dom": "^18.3.0"
+    }
   }
 }
 ```
@@ -211,6 +219,9 @@ packages:
 ```
 auto-install-peers=true
 strict-peer-dependencies=false
+# Hoist React type packages to the root so third-party .d.ts files (react-router, cmdk, dnd-kit) resolve them under pnpm's isolated layout.
+public-hoist-pattern[]=@types/react
+public-hoist-pattern[]=@types/react-dom
 ```
 
 ### 2.5 `.gitignore`
