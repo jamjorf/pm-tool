@@ -13,7 +13,7 @@ export function effectiveRoleFromStore(store: Store, me: Me | null, projectId: s
   for (const m of me.memberships) memberships[m.project_id] = m.role;
   if (membership) memberships[projectId] = membership.role;
   try {
-    return permissions.effectiveRole({ id: me.user.id, firmRole: me.user.firm_role, memberships }, { id: project.id, visibility: project.visibility });
+    return permissions.effectiveRole({ id: me.user.id, firmRole: me.user.firm_role, memberships, isActive: me.user.is_active, isService: me.user.is_service }, { id: project.id, visibility: project.visibility });
   } catch {
     const fr = me.user.firm_role;
     if (fr === 'owner' || fr === 'admin') return 'admin';

@@ -60,7 +60,7 @@ export async function availableTransitions(q: Q, actor: Actor, item: Row) {
   const type = await getType(q, item.type_id);
   const def = await getWorkflowDef(q, type.workflow_id);
   const gctx = await loadGuardContext({ tx: q as any, actor }, item, project);
-  return workflowEngine.availableTransitions(def, item).map((t) => {
+  return workflowEngine.availableTransitions(def, item as any).map((t) => {
     const r = workflowEngine.evaluate(def, item as any, t.key, gctx);
     const to = def.states.find((s) => s.id === t.to_state_id)!;
     return { key: t.key, name: t.name, to_state: { id: to.id, key: to.key, name: to.name, category: to.category }, allowed: r.ok, failures: r.failures };

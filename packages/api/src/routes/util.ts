@@ -13,7 +13,7 @@ export const actorOf = (request: FastifyRequest): Actor => {
 export const queryOf = (request: FastifyRequest): Record<string, string | undefined> => (request.query ?? {}) as Record<string, string | undefined>;
 export const paramsOf = (request: FastifyRequest): Record<string, string> => (request.params ?? {}) as Record<string, string>;
 
-export function parse<T>(schema: z.ZodType<T>, value: unknown): T {
+export function parse<S extends z.ZodTypeAny>(schema: S, value: unknown): z.output<S> {
   const r = schema.safeParse(value ?? {});
   if (!r.success) throw validation('invalid request', r.error.issues.map((i) => ({ path: i.path.join('.'), message: i.message })));
   return r.data;

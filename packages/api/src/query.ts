@@ -45,14 +45,11 @@ export async function queryItems(q: Q, actor: Actor, spec: QuerySpec, opts: { tz
 
   let total = rows.length;
   if (spec.limit !== undefined || spec.offset !== undefined) {
-    try {
-      const countSpec: QuerySpec = { ...spec, group_by: null, sort: undefined, limit: undefined, offset: undefined };
-      const c = compileItems(countSpec, actor, fieldDefs, { tz: opts.tz, select: 'count(*)::int as total' });
-      const [r] = (await q.unsafe(c.text, c.values as any[])) as unknown as Row[];
-      total = Number(r?.total ?? rows.length);
-    } catch {
-      total = rows.length;
-    }
+    // The compiler always emits ORDER BY, so count through a subquery rather than a custom select.
+    const countSpec: QuerySpec = { ...spec, group_by: null, sort: undefined, limit: undefined, offset: undefined };
+    const c = compileItems(countSpec, actor, fieldDefs, { tz: opts.tz, select: 'w.id' });
+    const [r] = (await q.unsafe(`select count(*)::int as total from (${c.text}) sub`, c.values as any[])) as unknown as Row[];
+    total = Number(r?.total ?? rows.length);
   }
   const groups = spec.group_by ? await groupRows(q, rows, spec.group_by) : null;
   return { items: rows, groups, total };

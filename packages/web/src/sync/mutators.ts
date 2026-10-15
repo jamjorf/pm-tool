@@ -93,7 +93,7 @@ export async function effectiveRoleFor(tx: ReadTransaction, userId: string, proj
   if (user && project) {
     try {
       const memberships: Record<string, ProjectRole> = membership ? { [projectId]: membership.role } : {};
-      return permissions.effectiveRole({ id: user.id, firmRole: user.firm_role, memberships }, { id: project.id, visibility: project.visibility });
+      return permissions.effectiveRole({ id: user.id, firmRole: user.firm_role, memberships, isActive: user.is_active, isService: user.is_service }, { id: project.id, visibility: project.visibility });
     } catch {
       /* core stub or unexpected shape: fall back */
     }

@@ -120,7 +120,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     if (!me) return null;
     const memberships: Record<string, ProjectRole> = {};
     for (const m of me.memberships) memberships[m.project_id] = m.role;
-    return { id: me.user.id, firmRole: me.user.firm_role, memberships, isService: me.user.is_service };
+    return { id: me.user.id, firmRole: me.user.firm_role, memberships, isService: me.user.is_service, isActive: me.user.is_active };
   }, [me]);
 
   const value = useMemo<SessionValue>(

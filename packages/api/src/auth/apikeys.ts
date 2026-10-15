@@ -7,13 +7,13 @@ export function generateApiKey(): string {
   return API_KEY_PREFIX + randomToken(32);
 }
 
-export async function createApiKey(q: Q, userId: string, name: string, scopes: string[] = ['read', 'write'], expiresAt?: string | null) {
+export async function createApiKey(q: Q, userId: string, name: string, scopes: string[] = ['read', 'write'], expiresAt?: string | null): Promise<Row & { key: string }> {
   const key = generateApiKey();
   const [row] = await q`
     insert into api_keys (user_id, name, key_prefix, key_hash, scopes, expires_at)
     values (${userId}, ${name}, ${key.slice(0, 8)}, ${sha256(key)}, ${scopes}, ${expiresAt ?? null})
     returning id, name, key_prefix, scopes, expires_at, created_at`;
-  return { ...(row as Row), key };
+  return { ...(row as Row), key } as Row & { key: string };
 }
 
 export async function resolveApiKey(q: Q, key: string): Promise<{ id: string; user_id: string; name: string; scopes: string[] } | null> {

@@ -170,11 +170,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       state_key: statesById[w.state_id]?.key,
       type_key: typesById[w.type_id]?.key,
       project_key: projectsById[w.project_id]?.key,
+      state_name: statesById[w.state_id]?.name,
+      type_name: typesById[w.type_id]?.name,
+      project_name: projectsById[w.project_id]?.name,
+      assignee_name: w.assignee_id ? (usersById[w.assignee_id]?.name ?? null) : null,
       label_ids: labelIdsByItem[w.id] ?? [],
+      label_names: (labelIdsByItem[w.id] ?? []).map((id) => labelsById[id]?.name).filter((n): n is string => !!n),
       parent_id: parentByItem[w.id] ?? null,
       is_blocked: blockedItems.has(w.id),
     }));
-  }, [workItems, statesById, typesById, projectsById, labelIdsByItem, parentByItem, blockedItems]);
+  }, [workItems, statesById, typesById, projectsById, usersById, labelIdsByItem, labelsById, parentByItem, blockedItems]);
   const itemsById = useMemo(() => byId(items), [items]);
   const itemByKey = useMemo(() => {
     const out: Record<string, ItemRow> = {};
@@ -202,8 +207,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   );
 
   const lookups = useMemo<EvalLookups>(
-    () => ({ states: statesById, types: typesById, projects: projectsById, labelIdsByItem, parentByItem, blockedItems }),
-    [statesById, typesById, projectsById, labelIdsByItem, parentByItem, blockedItems],
+    () => ({ states: statesById, types: typesById, projects: projectsById, labels: labelsById, users: usersById, labelIdsByItem, parentByItem, blockedItems }),
+    [statesById, typesById, projectsById, labelsById, usersById, labelIdsByItem, parentByItem, blockedItems],
   );
 
   const store = useMemo<Store>(
