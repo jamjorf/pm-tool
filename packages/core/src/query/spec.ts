@@ -149,6 +149,7 @@ export const BUILTIN_FIELDS: Record<string, { kind: 'text' | 'number' | 'bool' |
   created_at: { kind: 'datetime', label: 'Created', sortable: true },
   updated_at: { kind: 'datetime', label: 'Updated', sortable: true },
   completed_at: { kind: 'datetime', label: 'Completed', sortable: true },
+  canceled_at: { kind: 'datetime', label: 'Canceled', sortable: true },
   archived_at: { kind: 'datetime', label: 'Archived', sortable: true },
   'state.category': { kind: 'enum', label: 'State category', sortable: true },
   'state.key': { kind: 'text', label: 'State key', sortable: true },

@@ -15,7 +15,7 @@ export type EventKind = (typeof EVENT_KINDS)[number];
 /** Fields of work_items that are tracked one-event-per-field in the activity log (JSONB fields are tracked per key as "fields.<key>"). */
 export const TRACKED_ITEM_FIELDS: (keyof WorkItem)[] = [
   'title', 'description', 'type_id', 'state_id', 'priority', 'assignee_id', 'reporter_id', 'start_date', 'due_date',
-  'estimate', 'confidential', 'archived_at', 'project_id', 'sort_order',
+  'estimate', 'confidential', 'completed_at', 'canceled_at', 'archived_at', 'project_id', 'sort_order',
 ];
 
 export type FieldChange = { field: string; old: unknown; new: unknown };

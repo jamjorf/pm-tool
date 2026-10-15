@@ -55,7 +55,7 @@ const COLUMN: Record<string, string> = {
   assignee_id: 'w.assignee_id', reporter_id: 'w.reporter_id', created_by: 'w.created_by',
   start_date: 'w.start_date', due_date: 'w.due_date', estimate: 'w.estimate', confidential: 'w.confidential',
   sort_order: 'w.sort_order', created_at: 'w.created_at', updated_at: 'w.updated_at',
-  completed_at: 'w.completed_at', archived_at: 'w.archived_at',
+  completed_at: 'w.completed_at', canceled_at: 'w.canceled_at', archived_at: 'w.archived_at',
   'state.category': 'w.state_category', 'state.key': 'w.state_key', 'type.key': 'w.type_key',
   'project.key': 'w.project_key', parent_id: 'w.parent_id', is_blocked: 'w.is_blocked', search: 'w.search',
 };

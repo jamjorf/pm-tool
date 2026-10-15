@@ -505,13 +505,19 @@ create index relations_external_idx on relations(external_kind, (external_ref->>
 create unique index relations_single_parent_uq on relations(to_item_id) where type = 'parent_of' and deleted_at is null;
 select install_sync_trigger('relations');
 
--- Prevent cycles in hierarchy and blocking graphs.
+-- Prevent cycles in hierarchy and blocking graphs; reject reverse duplicates of symmetric edges.
 create or replace function trg_relations_no_cycle() returns trigger
 language plpgsql as $$
 declare rt relation_types%rowtype; found boolean;
 begin
   if new.to_item_id is null or new.deleted_at is not null then return new; end if;
   select * into rt from relation_types where key = new.type;
+  -- symmetric types (duplicates, relates_to): the reverse edge is the same edge
+  if rt.is_symmetric and exists (
+       select 1 from relations r where r.type = new.type and r.from_item_id = new.to_item_id
+         and r.to_item_id = new.from_item_id and r.deleted_at is null and r.id <> new.id) then
+    raise exception 'relation % between % and % already exists (symmetric)', new.type, new.to_item_id, new.from_item_id using errcode = '23505';
+  end if;
   if not (rt.is_hierarchy or rt.is_blocking) then return new; end if;
   -- is there already a path to_item -> ... -> from_item of the same type?
   with recursive walk(item_id, depth) as (
@@ -818,6 +824,7 @@ language sql stable as $$
               else null end
      from users u, projects p where u.id = p_user and p.id = p_project and u.deleted_at is null and p.deleted_at is null)
   )
+  from users u0 where u0.id = p_user and u0.is_active and u0.deleted_at is null
 $$;
 
 -- Can the user see this item? (membership/visibility + confidential flag)
