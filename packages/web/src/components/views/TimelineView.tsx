@@ -1,6 +1,6 @@
 // Gantt timeline: rows = items (or grouped), zoom week/month/quarter, today line, drag to move/resize,
 // dependency arrows for `blocks` relations, unscheduled list below.
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { addDays, differenceInCalendarDays, eachMonthOfInterval, eachWeekOfInterval, format, max as maxDate, min as minDate, parseISO, startOfDay, startOfMonth, startOfWeek, startOfQuarter, addMonths, addWeeks, eachQuarterOfInterval, addQuarters } from 'date-fns';
 import type { ItemRow, Project, ViewSpec } from '@pm/core';
 import { useStore } from '../../store/hooks';
@@ -114,6 +114,14 @@ export function TimelineView({ items, groups, spec, project, onZoom }: { items: 
   };
 
   const height = rows.rows.length * ROW_H;
+
+  // Start with today in view (once per zoom level).
+  const todayX = x(today);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollLeft = Math.max(0, todayX - Math.max(200, (el.clientWidth - LABEL_W) / 3));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [zoom, rangeStart.getTime()]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
