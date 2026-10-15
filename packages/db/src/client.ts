@@ -9,9 +9,10 @@ export function databaseUrl(): string {
 }
 
 /** One-connection client for scripts (notices silenced; `date` columns kept as strings). */
-export function connect(url: string = databaseUrl()): Sql {
+export function connect(url: string = databaseUrl(), opts: { prepare?: boolean } = {}): Sql {
   return postgres(url, {
     max: 1,
+    prepare: opts.prepare ?? true,
     onnotice: () => undefined,
     types: { date: { to: 1082, from: [1082], serialize: (x: string) => x, parse: (x: string) => x } },
   });

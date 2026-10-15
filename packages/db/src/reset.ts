@@ -17,14 +17,25 @@ export function isLocalDatabaseUrl(url: string): boolean {
   }
 }
 
-export async function reset(sql: Sql, opts: { log?: (m: string) => void } = {}): Promise<void> {
+/**
+ * Drop `public`, re-run migrations and seed. Takes a URL rather than a client on
+ * purpose: dropping the schema invalidates every prepared statement (and the
+ * type OIDs postgres.js caches) on an existing connection, so this opens its own
+ * short-lived connection with prepared statements disabled.
+ */
+export async function reset(url: string = databaseUrl(), opts: { log?: (m: string) => void } = {}): Promise<void> {
   const log = opts.log ?? (() => undefined);
-  await sql.unsafe('drop schema public cascade; create schema public;');
-  log('schema public dropped and recreated');
-  const m = await runMigrations(sql, { log });
-  log(`migrate: ${m.applied.length} applied`);
-  const s = await seed(sql, { force: true, log });
-  if (s) log(`seed: ${s.work_items} work items in ${s.projects} projects`);
+  const sql: Sql = connect(url, { prepare: false });
+  try {
+    await sql.unsafe('drop schema public cascade; create schema public;');
+    log('schema public dropped and recreated');
+    const m = await runMigrations(sql, { log });
+    log(`migrate: ${m.applied.length} applied`);
+    const s = await seed(sql, { force: true, log });
+    if (s) log(`seed: ${s.work_items} work items in ${s.projects} projects`);
+  } finally {
+    await sql.end({ timeout: 5 });
+  }
 }
 
 if (isMain(import.meta.url)) {
@@ -33,11 +44,6 @@ if (isMain(import.meta.url)) {
     console.error(`reset: refusing to drop non-local database ${url.replace(/\/\/.*@/, '//***@')}; pass --yes to override`);
     process.exit(1);
   }
-  const sql = connect(url);
-  try {
-    await reset(sql, { log: (m) => console.log(m) });
-    console.log('reset: done');
-  } finally {
-    await sql.end({ timeout: 5 });
-  }
+  await reset(url, { log: (m) => console.log(m) });
+  console.log('reset: done');
 }

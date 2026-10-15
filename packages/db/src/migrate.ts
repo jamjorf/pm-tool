@@ -62,6 +62,7 @@ export async function runMigrations(sql: Sql, opts: MigrateOptions = {}): Promis
     }
 
     for (const file of files) {
+      if (result.adopted.includes(file)) continue;
       if (done.has(file)) { result.skipped.push(file); continue; }
       const text = readFileSync(join(dir, file), 'utf8');
       // Multi-statement text with $$ bodies: unsafe() without params uses the simple
