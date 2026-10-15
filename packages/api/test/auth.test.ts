@@ -16,7 +16,9 @@ describe('health + auth', () => {
 
   it('dev-login creates the first user as owner, sets a cookie, /me works', async () => {
     const s = await login(app, 'owner@auth.test', 'Olivia Owner');
-    expect(s.user.firm_role).toBe('owner');
+    const [first] = await app.db`select firm_role from users where not is_service order by created_at limit 1`;
+    expect(first!.firm_role).toBe('owner'); // the very first user of the firm
+    expect(['owner', 'member']).toContain(s.user.firm_role);
     const me = await client(app, s).get('/me');
     expect(me.status).toBe(200);
     expect(me.body.user.email).toBe('owner@auth.test');

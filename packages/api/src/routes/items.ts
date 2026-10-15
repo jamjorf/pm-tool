@@ -9,7 +9,7 @@ import { workflowEngine } from '../core-compat.js';
 import { canViewItem, getItem, getProject, getType, getWorkflowDef, itemView, resolveItemId, resolveProjectId, stripSearch } from '../mutations/helpers.js';
 import { loadGuardContext } from '../mutations/items.js';
 import { queryItems } from '../query.js';
-import { actorOf, csv, flag, intQuery, itemIdParam, parse, paramsOf, queryOf, resolveIds, zKeys, zUuid } from './util.js';
+import { actorOf, csv, flag, intQuery, itemIdParam, parse, paramsOf, projectIdQuery, queryOf, resolveIds, zKeys, zUuid } from './util.js';
 
 const ItemCreateBody = z.object({
   id: zUuid.optional(),
@@ -76,7 +76,7 @@ export async function itemRoutes(app: FastifyInstance) {
     const actor = actorOf(request);
     const qs = queryOf(request);
     const limit = intQuery(qs.limit, 50, 500);
-    const projectId = qs.project ? await resolveProjectId(db, qs.project) : null;
+    const projectId = await projectIdQuery(db, request);
     const typeRef = qs.type ?? null;
     const categories = csv(qs.state_category) ?? null;
     const assignee = qs.assignee === 'me' ? actor.id : qs.assignee && isUuid(qs.assignee) ? qs.assignee : null;

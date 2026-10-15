@@ -13,12 +13,17 @@ export async function startApp(): Promise<FastifyInstance> {
 
 export interface Session { cookie: string; user: any; headers: Record<string, string> }
 
-export async function login(app: FastifyInstance, email: string, name?: string): Promise<Session> {
+/** Dev-login; `role` promotes the user (the test DB is shared across files, so only the very first user is a natural owner). */
+export async function login(app: FastifyInstance, email: string, name?: string, role?: 'owner' | 'admin' | 'member' | 'guest'): Promise<Session> {
   const res = await app.inject({ method: 'POST', url: '/auth/dev-login', payload: { email, name } });
   if (res.statusCode !== 200) throw new Error(`dev-login failed: ${res.statusCode} ${res.body}`);
   const c = res.cookies.find((x) => x.name === 'pm_session');
   if (!c) throw new Error('no session cookie');
-  return { cookie: c.value, user: res.json().user, headers: { cookie: `pm_session=${c.value}` } };
+  let user = res.json().user;
+  if (role && user.firm_role !== role) {
+    [user] = await app.db`update users set firm_role = ${role} where id = ${user.id} returning *`;
+  }
+  return { cookie: c.value, user, headers: { cookie: `pm_session=${encodeURIComponent(c.value)}` } };
 }
 
 export interface Res<T = any> { status: number; body: T; headers: Record<string, any> }

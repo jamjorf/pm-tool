@@ -11,7 +11,7 @@ const P = 'ITM';
 
 beforeAll(async () => {
   app = await startApp();
-  owner = await login(app, 'owner@items.test', 'Olivia Owner');
+  owner = await login(app, 'owner@items.test', 'Olivia Owner', 'owner');
   bob = await login(app, 'bob@items.test', 'Bob Builder');
   carol = await login(app, 'carol@items.test', 'Carol Coder');
   api = client(app, owner);

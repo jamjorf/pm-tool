@@ -20,7 +20,7 @@ declare module 'fastify' {
   }
 }
 
-/** Decorates requests with user/actor (never fails; use requireAuth to enforce). */
+/** Decorates requests with user/actor (never fails; use requireAuth to enforce). Skip-override so the hook applies app-wide. */
 export async function authPlugin(app: FastifyInstance) {
   app.decorateRequest('user', null);
   app.decorateRequest('actor', null);
@@ -76,3 +76,6 @@ export function requireFirmAdmin(request: FastifyRequest) {
   if (!a) throw unauthorized();
   if (a.firmRole !== 'owner' && a.firmRole !== 'admin') throw forbidden('firm admin required');
 }
+
+// Apply to the parent context (like fastify-plugin) so every route sees request.actor.
+(authPlugin as unknown as Record<symbol, boolean>)[Symbol.for('skip-override')] = true;

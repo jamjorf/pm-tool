@@ -24,7 +24,7 @@ export async function loadActor(q: Q, userId: string, opts: { scopes?: string[] 
   const rows = await q`select project_id, role from project_members where user_id = ${userId} and deleted_at is null`;
   const memberships: Record<string, ProjectRole> = {};
   for (const r of rows) memberships[r.project_id] = r.role as ProjectRole;
-  const actor: Actor = { id: user.id, firmRole: user.firm_role, memberships, isService: user.is_service };
+  const actor: Actor = { id: user.id, firmRole: user.firm_role, memberships, isService: user.is_service, isActive: user.is_active } as Actor;
   if (opts.scopes) actor.scopes = opts.scopes;
   return actor;
 }
