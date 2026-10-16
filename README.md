@@ -21,20 +21,52 @@ Stack: Postgres 16 · TypeScript monorepo (pnpm) · Fastify API · React + Repli
 
 Documentation lives in `docs/`: start with [`docs/README.md`](docs/README.md). The one-shot rebuild prompt is [`docs/BUILD-PROMPT.md`](docs/BUILD-PROMPT.md).
 
-## Quick start
+## Quick start guide
+
+Full guide with a five-minute tour: [Quick Start](https://github.com/jamjorf/pm-tool/wiki/Quick-Start) in the wiki.
+
+**Prerequisites:** Node 22, pnpm 10 (`corepack enable` is enough), and Docker, or any Postgres 15+ you can point `DATABASE_URL` at.
 
 ```bash
-cp .env.example .env
-docker compose up -d postgres        # or point DATABASE_URL at your own Postgres 15+
+git clone https://github.com/jamjorf/pm-tool && cd pm-tool
+cp .env.example .env                 # defaults work for local use
+docker compose up -d postgres        # skip if you set DATABASE_URL to your own Postgres
 pnpm install
 pnpm --filter @pm/core build         # other packages import @pm/core from its dist
-pnpm db:migrate && pnpm db:seed
-pnpm dev                             # API on :3001, web on :5173
+pnpm db:migrate && pnpm db:seed      # schema + realistic demo data
+pnpm dev                             # API on http://localhost:3001, web on http://localhost:5173
 ```
 
-Open http://localhost:5173 and sign in with a seeded email (e.g. `alice@firm.com`, the firm owner) via the dev login box. `scripts/dev.sh` does all of the above in one go.
+1. Open http://localhost:5173 and sign in as `alice@firm.com` (firm owner) using the dev login box. No password is needed in dev mode.
+2. Open the **Rates Desk Platform** project. The sidebar lists its saved views: All open (list), Board, Roadmap (timeline), Overview (dashboard).
+3. Press `Ctrl/⌘ K` for the command palette, `c` to create an item, `?` for the keyboard cheatsheet.
+4. Drag a card on the board: transitions whose guards fail (for example "Start" without an assignee) are refused with the reason.
+5. Settings → API keys creates a key for scripts and agents; `packages/mcp/README.md` shows how to connect the MCP server to Claude Code.
+
+`scripts/dev.sh` runs the whole sequence above in one command. To start over: `pnpm db:reset -- --yes` (local databases only).
 
 Seeded data: users alice (owner), bob (admin), carol, dan, eve, frank, grace, hugo (members) and a service user `agent@firm.com`; projects `RATES`, `EQD`, `OPS` (firm-visible) and `ONB` (private); 60 work items across task/bug/initiative/request types with relations, comments, views and notifications.
+
+## Documentation wiki
+
+The wiki at https://github.com/jamjorf/pm-tool/wiki is the task-oriented guide; its source lives in [`wiki/`](wiki/) and is published by the "Sync wiki" workflow on every push to `main` (enable Wikis under Settings → Features and create any first page once, then the workflow takes over).
+
+| Page | What it covers |
+|---|---|
+| [Quick Start](https://github.com/jamjorf/pm-tool/wiki/Quick-Start) | Install, run, first login, five-minute tour, troubleshooting |
+| [Data Model](https://github.com/jamjorf/pm-tool/wiki/Data-Model) | The five pillars, entity diagram, graph and permission functions |
+| [Workflows and Item Types](https://github.com/jamjorf/pm-tool/wiki/Workflows-and-Item-Types) | Guards, effects, adding a desk-specific type with SQL or the admin UI |
+| [Views and Queries](https://github.com/jamjorf/pm-tool/wiki/Views-and-Queries) | The QuerySpec grammar behind lists, boards, timelines and dashboards |
+| [Keyboard and Palette](https://github.com/jamjorf/pm-tool/wiki/Keyboard-and-Palette) | Shortcuts, palette modes, bulk edit |
+| [API](https://github.com/jamjorf/pm-tool/wiki/API) | Auth, routes, curl examples |
+| [Sync](https://github.com/jamjorf/pm-tool/wiki/Sync) | How local-first sync works and its limits |
+| [Integrations](https://github.com/jamjorf/pm-tool/wiki/Integrations) | Webhooks, Slack, GitHub, email |
+| [MCP Server](https://github.com/jamjorf/pm-tool/wiki/MCP-Server) | Tools, resources, prompts, setup for Claude Code |
+| [Operations](https://github.com/jamjorf/pm-tool/wiki/Operations) | Deployment, env vars, backups, scaling path |
+| [Development](https://github.com/jamjorf/pm-tool/wiki/Development) | Repo layout, commands, tests, conventions |
+| [Architecture Decisions](https://github.com/jamjorf/pm-tool/wiki/Architecture-Decisions) | ADR-001 to ADR-008 at a glance |
+
+The deeper design documents are in [`docs/`](docs/README.md): data model, system design, UX, integrations, operations, ADRs, and the one-shot rebuild prompt [`docs/BUILD-PROMPT.md`](docs/BUILD-PROMPT.md).
 
 ## Everyday commands
 
