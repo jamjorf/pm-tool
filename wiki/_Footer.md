@@ -1,0 +1,1 @@
+pm-tool wiki · [github.com/jamjorf/pm-tool](https://github.com/jamjorf/pm-tool) · full documentation in [docs/](https://github.com/jamjorf/pm-tool/blob/main/docs/README.md) · pages are synced from the repository's `wiki/` directory

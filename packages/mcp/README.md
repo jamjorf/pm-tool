@@ -112,7 +112,7 @@ flags anything blocked, then offers `transition_item` to start the first one.
 
 **"Create a bug in RATES for the stale 10y fixing, urgent, assign Alice, due Friday"** →
 `list_types` (bug has a required `severity` select) →
-`create_item {project:"RATES", type:"bug", title:"Stale 10y fixing", priority:1, assignee:"alice@example.com", due_date:"2026-10-17", fields:{severity:"high"}}`.
+`create_item {project:"RATES", type:"bug", title:"Stale 10y fixing", priority:1, assignee:"alice@firm.com", due_date:"2026-10-17", fields:{severity:"high"}}`.
 
 **"Triage RATES"** → the `triage_project` prompt: `query_items` over open items sorted by
 priority, a table of unassigned / overdue / stale items with proposed changes, applied
