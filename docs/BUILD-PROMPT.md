@@ -28,12 +28,10 @@ monorepo. Read this whole document before writing a file. Then:
    byte-for-byte the files you must create at the given paths. Do not
    "improve" them. Build the rest of the code against them.
 4. **Verify with tests, not by reading.** Every package has a `test` script
-   (vitest). Integration tests need Postgres: use `DATABASE_URL` (default
-   `postgres://postgres:postgres@localhost:5432/pmtool`) and start it with
-   `podman compose up -d postgres` if not running. If Podman is unavailable,
-   install Postgres locally; if neither is possible, keep going and mark the
-   DB-dependent tests as `skip` when `DATABASE_URL` is unreachable — but say
-   so in `PLAN.md`.
+   (vitest). The database is SQLite through Node's built-in `node:sqlite`
+   (Node 22.13+): `DATABASE_URL` is a file path (default `./data/pmtool.db`)
+   and tests open `:memory:` or a temporary file and apply the migration
+   themselves. Nothing has to be installed or started for any test.
 5. **Commit as you go.** `git init` at the start; one commit per phase with a
    message naming the phase and what passes. Never commit `.env`,
    `node_modules` or `dist`.
@@ -43,8 +41,10 @@ monorepo. Read this whole document before writing a file. Then:
 7. **Finish with the verification checklist (§9)** and make every line pass
    before declaring done (§10).
 
-Tooling assumptions: Node ≥ 22, pnpm 10 (`corepack enable && corepack prepare
-pnpm@10.28.0 --activate`), Podman 4.1+ with podman-compose (for Postgres 16), git.
+Tooling assumptions: Node ≥ 22.13 (for `node:sqlite`), pnpm 10 (`corepack
+enable && corepack prepare pnpm@10.28.0 --activate`), git. No database
+server, no container runtime, no native modules, no `sudo`. The `sqlite3`
+shell is optional (handy for the verification checklist).
 
 ---
 
@@ -58,9 +58,9 @@ views), not applications.
 ### 1.1 The data model (five non-negotiables)
 
 1. **One generic work item** with a `type` and typed columns plus validated
-   JSONB fields (`work_items.fields`, validated against
-   `item_types.field_defs` by a DB trigger and by `@pm/core`). No table per
-   type.
+   JSON fields (`work_items.fields`, JSON text validated against
+   `item_types.field_defs` by DB triggers using `json_each`/`json_type` and by
+   `@pm/core`). No table per type.
 2. **Workflows as an explicit, data-driven state machine per type**:
    `workflows` → `workflow_states` (with a closed `category`) →
    `workflow_transitions` with `guards[]` and `effects[]` as JSON, evaluated
@@ -68,18 +68,20 @@ views), not applications.
 3. **A typed relation edge table** (`relations` + `relation_types`
    registry): parent/child, blocks, duplicates, relates-to, links to external
    entities (GitHub PR, Slack thread, email, URL). Dependencies and rollups
-   are graph queries (`item_descendants`, `item_ancestors`,
-   `item_open_blockers`, `item_rollup`). Triggers enforce acyclicity and a
-   single parent.
+   are graph queries over the views `item_parents`, `item_ancestry`,
+   `open_blockers`, `item_rollups`. Triggers enforce acyclicity, reject the
+   reverse of a symmetric edge, and a partial unique index enforces a single
+   parent.
 4. **An append-only activity log, one event per field change**
-   (`activity_events`, UPDATE/DELETE/TRUNCATE physically blocked). It drives
-   history, audit, notifications, undo, webhooks and analytics.
+   (`activity_events`, UPDATE/DELETE physically blocked by triggers). It
+   drives history, audit, notifications, undo, webhooks and analytics.
 5. **Permissions decided up front: per-project roles** (`admin`/`editor`/
    `viewer`) plus firm role (`owner`/`admin`/`member`/`guest`), project
    visibility (`firm`/`private`) and a per-item `confidential` flag.
-   Attribute-style rules live in workflow guards. SQL functions
-   `effective_project_role()`, `can_view_item()`, `visible_project_ids()`
-   are the authority; `@pm/core` mirrors them.
+   Attribute-style rules live in workflow guards. The SQL views
+   `effective_roles(user_id, project_id, role)` and
+   `visible_items(user_id, item_id)` are the authority; `@pm/core` mirrors
+   them.
 
 ### 1.2 The tool
 
@@ -89,18 +91,19 @@ views), not applications.
   server (`compileQuery`) and in-memory on the client (`runSpec`), with
   parity tests.
 * **UX:** keyboard-first command palette (`⌘K`), instant navigation on
-  local data (Replicache, IndexedDB), bulk edit, good search (Postgres FTS +
-  trigram until it isn't), low-noise notifications (inbox, collapsing,
-  digests, quiet hours).
+  local data (Replicache, IndexedDB), bulk edit, good search (SQLite FTS5 +
+  bm25 ranking with a LIKE fallback, until it isn't), low-noise notifications
+  (inbox, collapsing, digests, quiet hours).
 * **Integrations:** webhooks out (HMAC-signed, retried), a clean REST API
   in (session cookie or API key), Slack (unfurls, autolink, `/pm` slash
   command, interactive buttons, DMs), email (inbound address scheme
   `pm+KEY-12@domain`, SMTP out), GitHub (PR/issue links, `Fixes KEY-12` on
   merge), and an **MCP server** so agents can read and act on tickets.
-* **Stack:** Postgres 16, TypeScript monorepo (pnpm, ESM, NodeNext), Fastify
-  5 API, React 18 + Vite + Replicache web app, zod 3, vitest. **Single
-  region, one API process, no microservices, no queue, no cache.** The hard
-  parts are the data model and the sync, not scale.
+* **Stack:** SQLite via Node's built-in `node:sqlite` (one file in WAL mode;
+  no server, no native module), TypeScript monorepo (pnpm, ESM, NodeNext),
+  Fastify 5 API, React 18 + Vite + Replicache web app, zod 3, vitest.
+  **Single region, one API process, one writer, no microservices, no queue,
+  no cache.** The hard parts are the data model and the sync, not scale.
 
 ### 1.3 Non-goals
 
@@ -122,13 +125,12 @@ pm-tool/
 ├── .npmrc
 ├── .gitignore
 ├── .env.example
-├── compose.yml
 ├── README.md
 ├── PLAN.md                      (yours)
 ├── docs/
 │   └── ARCHITECTURE.md          (§3, verbatim)
 └── packages/
-    ├── db/            @pm/db            migrations/0001_init.sql (§4), src/{migrate,seed,reset}.ts
+    ├── db/            @pm/db            migrations/0001_init.sql (§4), src/{sqlite,client,index,migrate,seed,reset}.ts
     ├── core/          @pm/core          src/{index,schema/entities,query/{spec,compile,evaluate},mutations,workflow/{types,engine},permissions/{types,evaluate},fields,events}.ts
     ├── api/           @pm/api           src/{server,app,db,auth,sync,mutations/*,routes/*,workers/*,integrations}.ts
     ├── integrations/  @pm/integrations  src/{index,deps,slack,github,email,render}.ts
@@ -139,8 +141,9 @@ pm-tool/
 Conventions (binding): ESM (`"type":"module"`), TypeScript `NodeNext`,
 imports inside a package use `.js` extensions, rows are **snake_case exactly
 as in SQL**, ids are UUIDs generated by the client (`crypto.randomUUID()`),
-validation with zod 3, tests with vitest, build order `@pm/core` first then
-`pnpm -r build`.
+booleans are 0/1 and JSON is text in SQL (the `@pm/db` runtime hydrates rows
+to `true`/`false` and parsed JSON by column name), validation with zod 3,
+tests with vitest, build order `@pm/core` first then `pnpm -r build`.
 
 ### 2.1 `package.json` (root)
 
@@ -239,13 +242,18 @@ coverage/
 .vite/
 packages/web/dist/
 *.tsbuildinfo
+data/
+*.db
+*.db-wal
+*.db-shm
 ```
 
 ### 2.6 `.env.example`
 
 ```bash
-# Postgres connection used by api, db, mcp
-DATABASE_URL=postgres://postgres:postgres@localhost:5432/pmtool
+# SQLite database file used by api and db (path relative to the repo root,
+# an absolute path, sqlite:path, or :memory:). Created on first use; no server needed.
+DATABASE_URL=./data/pmtool.db
 
 # API server
 PORT=3001
@@ -276,50 +284,24 @@ MCP_TRANSPORT=stdio
 PM_API_KEY=
 ```
 
-### 2.7 `compose.yml` (dev, Podman)
-
-```yaml
-# Local Postgres for development. Written for Podman:
-#   podman compose up -d postgres        (Podman 4.1+; needs podman-compose or docker-compose installed as the provider)
-# The file follows the Compose specification, so `docker compose` reads it unchanged.
-services:
-  postgres:
-    image: docker.io/library/postgres:16   # fully qualified so Podman never asks which registry to use
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: pmtool
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d pmtool"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-volumes:
-  pgdata:
-```
-
-### 2.8 `README.md`
+### 2.7 `README.md`
 
 ````markdown
 # pm-tool
 
 A firm-wide project management tool built around five ideas:
 
-1. **One generic work item** with a type and validated JSONB fields — no table per type.
+1. **One generic work item** with a type and validated JSON fields — no table per type.
 2. **Workflows as data** — states, transitions, guards and effects live in rows, not enums.
 3. **Relations as a typed graph** — parent/child, blocks, duplicates and links to external systems are one edge table; rollups and dependencies are graph queries.
 4. **Append-only activity log** — one event per field change gives history, audit, notifications, undo and analytics.
 5. **Views are saved queries** — lists, boards, timelines and dashboards are the same `QuerySpec`, run on the server as SQL and on the client against local data.
 
-Stack: Postgres 16 · TypeScript monorepo (pnpm) · Fastify API · React + Replicache (local-first sync) · MCP server for agents · Slack / email / GitHub integrations · webhooks out · single-region, single process.
+Stack: SQLite via Node's built-in `node:sqlite` (one file, no server, no native module) · TypeScript monorepo (pnpm) · Fastify API · React + Replicache (local-first sync) · MCP server for agents · Slack / email / GitHub integrations · webhooks out · single-region, single process.
 
 | Package | What it is | Tests |
 |---|---|---|
-| `packages/db` | The data model: plain SQL migrations (`migrations/0001_init.sql` stands alone), runner, seed | 7 |
+| `packages/db` | The data model and the SQLite runtime: plain SQL migrations (`migrations/0001_init.sql` stands alone), `openDb` + the `sql` tag, runner, seed, reset | 7 |
 | `packages/core` | Browser-safe shared logic: entity schemas, QuerySpec compiler (SQL) + evaluator (client), workflow engine, permissions, field validation, activity diffs | 155 (incl. 78 SQL/local parity cases) |
 | `packages/api` | Fastify server: auth, REST v1, Replicache push/pull/poke, activity log, notifications, webhooks, search | 31 |
 | `packages/web` | React app: command palette, saved-query views, bulk edit, item detail, inbox, admin editors | 14 |
@@ -332,15 +314,14 @@ Documentation lives in `docs/`: start with [`docs/README.md`](docs/README.md). T
 
 Full guide with a five-minute tour: [Quick Start](https://github.com/jamjorf/pm-tool/wiki/Quick-Start) in the wiki.
 
-**Prerequisites:** Node 22, pnpm 10 (`corepack enable` is enough), and Podman 4.1+ with a compose provider (`podman-compose`), or any Postgres 15+ you can point `DATABASE_URL` at.
+**Prerequisites:** Node 22.13+ and pnpm 10 (`corepack enable` is enough). Nothing else: the database is a SQLite file created on first run, so there is no database server, no container runtime and no `sudo`.
 
 ```bash
 git clone https://github.com/jamjorf/pm-tool && cd pm-tool
-cp .env.example .env                 # defaults work for local use
-podman compose up -d postgres        # skip if you set DATABASE_URL to your own Postgres
+cp .env.example .env                 # defaults work for local use (DATABASE_URL=./data/pmtool.db)
 pnpm install
 pnpm --filter @pm/core build         # other packages import @pm/core from its dist
-pnpm db:migrate && pnpm db:seed      # schema + realistic demo data
+pnpm db:migrate && pnpm db:seed      # creates ./data/pmtool.db, applies the schema, loads demo data
 pnpm dev                             # API on http://localhost:3001, web on http://localhost:5173
 ```
 
@@ -350,7 +331,7 @@ pnpm dev                             # API on http://localhost:3001, web on http
 4. Drag a card on the board: transitions whose guards fail (for example "Start" without an assignee) are refused with the reason.
 5. Settings → API keys creates a key for scripts and agents; `packages/mcp/README.md` shows how to connect the MCP server to Claude Code.
 
-`scripts/dev.sh` runs the whole sequence above in one command. To start over: `pnpm db:reset -- --yes` (local databases only).
+`scripts/dev.sh` runs the whole sequence above in one command. To start over: `pnpm db:reset -- --yes` (deletes the local database file, migrates, seeds), or stop the API and `rm data/pmtool.db*`.
 
 Seeded data: users alice (owner), bob (admin), carol, dan, eve, frank, grace, hugo (members) and a service user `agent@firm.com`; projects `RATES`, `EQD`, `OPS` (firm-visible) and `ONB` (private); 60 work items across task/bug/initiative/request types with relations, comments, views and notifications.
 
@@ -361,7 +342,7 @@ The wiki at https://github.com/jamjorf/pm-tool/wiki is the task-oriented guide; 
 | Page | What it covers |
 |---|---|
 | [Quick Start](https://github.com/jamjorf/pm-tool/wiki/Quick-Start) | Install, run, first login, five-minute tour, troubleshooting |
-| [Data Model](https://github.com/jamjorf/pm-tool/wiki/Data-Model) | The five pillars, entity diagram, graph and permission functions |
+| [Data Model](https://github.com/jamjorf/pm-tool/wiki/Data-Model) | The five pillars, entity diagram, graph and permission views, FTS5 search |
 | [Workflows and Item Types](https://github.com/jamjorf/pm-tool/wiki/Workflows-and-Item-Types) | Guards, effects, adding a desk-specific type with SQL or the admin UI |
 | [Views and Queries](https://github.com/jamjorf/pm-tool/wiki/Views-and-Queries) | The QuerySpec grammar behind lists, boards, timelines and dashboards |
 | [Keyboard and Palette](https://github.com/jamjorf/pm-tool/wiki/Keyboard-and-Palette) | Shortcuts, palette modes, bulk edit |
@@ -371,7 +352,7 @@ The wiki at https://github.com/jamjorf/pm-tool/wiki is the task-oriented guide; 
 | [MCP Server](https://github.com/jamjorf/pm-tool/wiki/MCP-Server) | Tools, resources, prompts, setup for Claude Code |
 | [Operations](https://github.com/jamjorf/pm-tool/wiki/Operations) | Deployment, env vars, backups, scaling path |
 | [Development](https://github.com/jamjorf/pm-tool/wiki/Development) | Repo layout, commands, tests, conventions |
-| [Architecture Decisions](https://github.com/jamjorf/pm-tool/wiki/Architecture-Decisions) | ADR-001 to ADR-008 at a glance |
+| [Architecture Decisions](https://github.com/jamjorf/pm-tool/wiki/Architecture-Decisions) | ADR-001 to ADR-009 at a glance |
 
 The deeper design documents are in [`docs/`](docs/README.md): data model, system design, UX, integrations, operations, ADRs, and the one-shot rebuild prompt [`docs/BUILD-PROMPT.md`](docs/BUILD-PROMPT.md).
 
@@ -379,7 +360,8 @@ The deeper design documents are in [`docs/`](docs/README.md): data model, system
 
 ```bash
 pnpm -r build | typecheck | test     # whole repo (build @pm/core first on a fresh clone)
-pnpm db:reset -- --yes               # drop, migrate, seed (local databases only)
+pnpm db:reset -- --yes               # delete the local SQLite file, migrate, seed
+sqlite3 data/pmtool.db               # inspect the database by hand (optional tool)
 pnpm dev:mcp                         # MCP server on stdio (needs PM_API_KEY, see packages/mcp/README.md)
 python3 scripts/build-prompt/gen.py  # regenerate docs/BUILD-PROMPT.md after changing SQL/contracts
 ```
@@ -401,7 +383,8 @@ Register the MCP server with Claude Code: `claude mcp add pm-tool -e API_URL=htt
 
 ```
 docs/            01-data-model · 02-design · 03-ux · 04-integrations · 05-operations · adr/ · BUILD-PROMPT
-packages/db      migrations/*.sql, src/{migrate,seed,reset}.ts
+data/            pmtool.db (+ -wal/-shm while running); created by pnpm db:migrate, git-ignored
+packages/db      migrations/*.sql, src/{sqlite,client,migrate,seed,reset}.ts   (sqlite.ts = openDb + sql tag)
 packages/core    src/{schema,query,workflow,permissions}, fields.ts, events.ts, mutations.ts
 packages/api     src/{auth,mutations,sync,notifications,webhooks,routes}, test/
 packages/web     src/{sync,store,components,pages}
@@ -410,7 +393,7 @@ packages/integrations  src/{slack,github,email}, render.ts, routes.ts
 ```
 ````
 
-### 2.9 Per-package `package.json` files
+### 2.8 Per-package `package.json` files
 
 Use these as given (versions are known-good; you may bump patch versions if
 installation fails). Each package also gets a `tsconfig.json` extending
@@ -446,8 +429,8 @@ core/web/mcp, `"types": ["node"]` for db/api) and a `vitest.config.ts`:
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@pm/db": "workspace:*",
     "@types/node": "^22.10.2",
-    "postgres": "^3.4.9",
     "typescript": "^5.6.3",
     "vitest": "^2.1.8"
   }
@@ -465,9 +448,22 @@ core/web/mcp, `"types": ["node"]` for db/api) and a `vitest.config.ts`:
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
-    "./migrate": { "types": "./dist/migrate.d.ts", "import": "./dist/migrate.js" },
-    "./seed": { "types": "./dist/seed.d.ts", "import": "./dist/seed.js" }
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./migrate": {
+      "types": "./dist/migrate.d.ts",
+      "import": "./dist/migrate.js"
+    },
+    "./seed": {
+      "types": "./dist/seed.d.ts",
+      "import": "./dist/seed.js"
+    },
+    "./sqlite": {
+      "types": "./dist/sqlite.d.ts",
+      "import": "./dist/sqlite.js"
+    }
   },
   "scripts": {
     "migrate": "tsx src/migrate.ts",
@@ -479,7 +475,6 @@ core/web/mcp, `"types": ["node"]` for db/api) and a `vitest.config.ts`:
     "test": "vitest run"
   },
   "dependencies": {
-    "postgres": "^3.4.5",
     "tsx": "^4.19.2"
   },
   "devDependencies": {
@@ -641,9 +636,9 @@ core/web/mcp, `"types": ["node"]` for db/api) and a `vitest.config.ts`:
     "@fastify/cookie": "^11.1.3",
     "@fastify/cors": "^11.3.1",
     "@pm/core": "workspace:*",
+    "@pm/db": "workspace:*",
     "@pm/integrations": "workspace:*",
     "fastify": "^5.12.7",
-    "postgres": "^3.4.9",
     "zod": "^3.23.8"
   },
   "devDependencies": {
@@ -675,7 +670,7 @@ are the source of truth; this doc explains how the pieces connect.
 
 | Package | npm name | Purpose |
 |---|---|---|
-| `packages/db` | `@pm/db` | SQL migrations (plain `.sql`, numbered), tiny migration runner, seed script. **Standalone data model.** |
+| `packages/db` | `@pm/db` | The SQLite runtime layer (`openDb`, the `sql` tag, transactions, row hydration), SQL migrations (plain `.sql`, numbered), tiny migration runner, seed and reset scripts. **Standalone data model.** Built on Node's `node:sqlite`; no native module, no server. |
 | `packages/core` | `@pm/core` | Pure, browser-safe TypeScript shared by everything: entity zod schemas, QuerySpec (+ SQL compiler + local evaluator), workflow engine, permission evaluator, mutation vocabulary, field validation, event helpers. **No Node-only imports, no I/O.** |
 | `packages/api` | `@pm/api` | Fastify 5 server: auth, REST API v1, Replicache-style sync (`/sync/push`, `/sync/pull`, `/sync/poke` SSE), activity log writer, notifications, webhooks-out dispatcher, FTS search, integration inbound routes (mounted from `@pm/integrations`). |
 | `packages/web` | `@pm/web` | Vite + React 18 SPA. Local-first via Replicache (IndexedDB). Command palette, saved-query views (list/board/timeline/dashboard), bulk edit, search, notifications inbox, item detail, admin (workflows/types/webhooks). |
@@ -685,52 +680,80 @@ are the source of truth; this doc explains how the pieces connect.
 Conventions: ESM (`"type":"module"`), TS `NodeNext`, imports inside a package
 use `.js` extensions, rows are **snake_case exactly as in SQL**, ids are
 UUIDs generated by the client (`crypto.randomUUID()`) so optimistic UI is
-stable. Validation with zod 3. Tests with vitest. Build order: `@pm/core`
-first (`pnpm --filter @pm/core build`), then the rest (`pnpm -r build`).
+stable. In SQL, booleans are 0/1 and JSON is text; the `@pm/db` runtime
+hydrates rows (JSON columns parsed, 0/1 → `true`/`false` by column name) so
+every layer above it sees typed values. Validation with zod 3. Tests with
+vitest. Build order: `@pm/core` first (`pnpm --filter @pm/core build`), then
+the rest (`pnpm -r build`).
 
-Env vars: see `.env.example`. `DATABASE_URL` is the only required one.
+Env vars: see `.env.example`. `DATABASE_URL` is the path of the SQLite file
+(relative to the repo root, absolute, `sqlite:`/`file:` prefixed, or
+`:memory:`); it defaults to `./data/pmtool.db`, so nothing is strictly
+required. The file and its directory are created on first open.
 
 ## Data model (summary; details in docs/01-data-model.md)
 
 * `work_items` — one generic entity. `type_id` → `item_types`, whose
-  `field_defs` (JSON array of `FieldDef`) describe the validated JSONB in
-  `work_items.fields`. A DB trigger rejects unknown keys / wrong kinds /
-  missing required; `@pm/core` `validateFields()` does the same + option
-  membership before the write.
+  `field_defs` (JSON array of `FieldDef`) describe the validated JSON object
+  in `work_items.fields`. DB triggers (`work_items_validate_fields_*`,
+  using `json_each`/`json_type`) reject unknown keys / wrong kinds / missing
+  required; `@pm/core` `validateFields()` does the same + option membership
+  before the write. `number`/`key` (`RATES-12`) are assigned by an AFTER
+  INSERT trigger, so `RETURNING` shows them as null: read the row back.
+  Full-text search is the FTS5 table `work_items_fts` (key/title/description,
+  `porter unicode61`), kept in sync by triggers.
 * Workflows are data: `workflows` → `workflow_states` (with `category`) →
   `workflow_transitions` (`from_state_id` null = any; `guards[]`, `effects[]`).
   Evaluated by `@pm/core` `workflowEngine`.
 * Relations: one `relations` edge table, `type` ∈ `relation_types`
   (`parent_of`, `blocks`, `duplicates`, `relates_to`, `links_to`). External
   entities use `to_item_id = null` + `external_kind`/`external_ref`. Triggers
-  enforce acyclicity and single parent. Graph helpers: `item_descendants()`,
-  `item_ancestors()`, `item_open_blockers()`, `item_rollup()`.
-* `activity_events` — append-only (trigger blocks UPDATE/DELETE/TRUNCATE).
-  One row per field change, grouped by `txn_id`. `id` is a monotonic bigint
-  used as the cursor for feeds, webhooks and notifications.
+  (`relations_no_cycle_*`, recursive CTE) enforce acyclicity and reject the
+  reverse of a symmetric edge; a partial unique index enforces single parent.
+  Graph helpers are views: `item_parents(item_id, parent_id)`,
+  `item_ancestry(ancestor_id, item_id, depth)`, `open_blockers(item_id,
+  blocker_id)`, `item_rollups(root_id, total, done, in_progress, todo,
+  canceled, estimate_total, estimate_done)`.
+* `activity_events` — append-only (triggers block UPDATE and DELETE; SQLite
+  has no TRUNCATE). One row per field change, grouped by `txn_id`. `id` is
+  `integer primary key autoincrement`, a monotonic cursor for feeds, webhooks
+  and notifications.
 * Permissions: `users.firm_role` (owner/admin/member/guest) +
   `project_members.role` (admin/editor/viewer) + `projects.visibility`
-  (firm/private) + `work_items.confidential`. SQL: `effective_project_role()`,
-  `can_view_item()`, `visible_project_ids()`. TS: `permissions.can()`.
-  Firm `member` gets `editor` on every `firm`-visible project without an
-  explicit membership row; `guest` only sees projects they are added to.
+  (firm/private) + `work_items.confidential`. SQL: the views
+  `effective_roles(user_id, project_id, role)` and
+  `visible_items(user_id, item_id)` (SQLite has no SQL functions). TS:
+  `permissions.can()`. Firm `member` gets `editor` on every `firm`-visible
+  project without an explicit membership row; `guest` only sees projects they
+  are added to.
 * Views are saved queries: `views.spec` is a `ViewSpec` (= `QuerySpec` +
-  presentation). All synced tables have `version` (global sync sequence) and
-  `deleted_at` tombstones.
+  presentation). All synced tables have `version` (stamped by trigger from
+  the one-row `sync_state` table) and `deleted_at` tombstones. Types: ids
+  are UUID text, timestamps ISO-8601 UTC text, dates `YYYY-MM-DD` text,
+  booleans 0/1 with CHECK, enums CHECK constraints, JSON columns text; former
+  arrays (`scopes`, `event_kinds`, `allowed_type_ids`, `notification_ids`) are
+  JSON arrays. Seeded workflows/states/types have fixed UUIDs
+  (`…a01`/`…a02` workflows, `…b01`–`…b14` states, `…d01`–`…d04` types).
 
 ## The query layer (one spec, two executors)
 
 `QuerySpec = { filter?: FilterExpr, sort?: SortSpec[], group_by?: FieldRef, limit?, offset? }`.
 
-* Server: `compileQuery(spec, ctx, opts)` → `{ text, values }` over the
-  `work_items_v` view (columns: everything in `work_items` plus `type_key`,
-  `state_key`, `state_category`, `project_key`, `assignee_name`,
-  `label_names`, `parent_id`, `is_blocked`). `fields.<key>` compiles to
-  `w.fields->>'key'` with a cast based on the field kind. `labels` compiles
-  to an EXISTS over `work_item_labels`. `search` compiles to
-  `w.search @@ websearch_to_tsquery('english', $n)` with `ts_rank` ordering,
-  falling back to `title % $n` (pg_trgm) when FTS finds nothing. The
-  permission scope is added as an extra WHERE (`visibilityWhere(userId)`).
+* Server: `compileQuery(spec, ctx, opts)` → `{ text, values }` (SQLite SQL
+  with positional `?` placeholders) over the `work_items_v` view (columns:
+  everything in `work_items` plus `type_key`, `state_key`, `state_category`,
+  `project_key`, `assignee_name`, `label_names` (JSON array), `parent_id`,
+  `is_blocked` (0/1)). `fields.<key>` compiles to
+  `json_extract(w.fields, '$.key')`; multi-valued kinds use `json_each`.
+  `labels` compiles to an EXISTS over `work_item_labels`. `search` compiles
+  to a join on `w.id` against the FTS hit set
+  `(select id, bm25(work_items_fts, 10.0, 5.0, 1.0) as rank from work_items_fts where work_items_fts match ?)`,
+  deduplicated by id and ordered by `rank`; the search route falls back to
+  `LIKE` on key/title when FTS finds nothing. The permission scope is
+  added as an extra WHERE: `visibilityWhere(userId)` =
+  `exists (select 1 from visible_items vi where vi.user_id = ? and vi.item_id = w.id)`.
+  Widget time buckets (`day`/`week`/`month`) are computed in UTC with
+  `strftime`; weeks start on Monday.
 * Client: `runSpec(spec, items, ctx, lookups)` evaluates the same spec over
   rows from the local Replicache store. `matchesFilter` must agree with the
   SQL compiler for every op (the core tests assert parity on a fixture set).
@@ -756,43 +779,50 @@ mutationName, actorKind, actorLabel }`. It must:
 
 1. Check permissions with `permissions.assert()`.
 2. Validate `fields` with `validateFields()` for the item's type.
-3. For `transitionItem`, load `GuardContext` (role, open blockers via
-   `item_open_blockers()`, children categories, labels) and call
+3. For `transitionItem`, load `GuardContext` (role from `effective_roles`,
+   open blockers via `open_blockers`, children categories, labels) and call
    `workflowEngine.evaluate()`; apply `patch`; execute `deferredEffects`
    (notify → notifications; webhook → enqueue; transition_parent_if /
    transition_children → recursive transitions; add/remove_label).
 4. Diff before/after and insert **one `activity_events` row per changed
-   field** (JSONB keys as `fields.<key>`), all sharing `txn_id`.
+   field** (JSON keys as `fields.<key>`), all sharing `txn_id`.
 5. Maintain `item_watchers` (assignee, reporter, commenter, mention → auto-watch).
 6. Produce notifications per `notification_preferences.rules`, never for the actor's own action, collapsing unread duplicates per (user, item, kind).
 7. Enqueue `webhook_deliveries` for endpoints whose `event_kinds` match (`*` matches all).
 8. Set `sync_client_groups.resync_required = true` for affected users when membership / visibility / confidentiality changes.
 
-Every write transaction that touches synced tables takes
-`select pg_advisory_xact_lock(42)` first so that `version` order equals
-commit order (global version strategy).
+Every write transaction that touches synced tables runs in `sql.begin()`
+from `@pm/db`, i.e. `BEGIN IMMEDIATE`: SQLite's single write lock serialises
+writers for the life of the transaction, so `version` order equals commit
+order (global version strategy) without an advisory lock. Transactions must
+be short and must never span network I/O; workers claim rows in one short
+transaction, do the I/O, and record the result in another. Trigger
+`RAISE(ABORT)` messages (`sqliteErrorKind(e) === 'trigger'`) and CHECK/NOT
+NULL failures map to 400 `validation`; UNIQUE failures map to 409 `conflict`.
 
 ## Sync protocol (Replicache-compatible)
 
-* `POST /sync/push` body `PushRequest`. For each mutation: in one transaction
-  with the advisory lock, read `sync_clients.last_mutation_id`; skip if
+* `POST /sync/push` body `PushRequest`. For each mutation: in one
+  `BEGIN IMMEDIATE` transaction, read `sync_clients.last_mutation_id`; skip if
   `mutation.id <= last`; error if `> last + 1`; otherwise
   `applyMutation()` and set `last_mutation_id = mutation.id`,
-  `version = nextval('sync_version_seq')`. Errors inside a mutation are
+  `version = sql.nextVersion()` (`sync_state.version + 1`). Errors inside a mutation are
   logged, the mutation is **still marked applied** (Replicache semantics:
   the client's optimistic change is rolled back on next pull) and a
   `notifications` row of kind `mutation_rejected` is created for the user so the UI can show "that change was rejected: <reason>". After the push, poke.
 * `POST /sync/pull` body `PullRequest`; `cookie` is the last `version` the
-  client saw (null → 0). Response `PullResponse`:
-  `{ cookie: <max version in snapshot>, lastMutationIDChanges, patch }`.
+  client saw (null → 0). The pull runs in one deferred read transaction
+  (`sql.snapshot()`, a consistent WAL snapshot) and reads `sync_state.version`
+  inside it. Response `PullResponse`:
+  `{ cookie: <sync_state.version in that snapshot>, lastMutationIDChanges, patch }`.
   If cookie is null/0 or the client group has `resync_required`, send
   `{op:'clear'}` followed by `put`s of every visible row and clear the
   flag. Otherwise, for each synced table, select rows with
   `version > cookie`: emit `put` when the row is visible to the user and
   `deleted_at is null`, otherwise `del`. Visibility per table:
   * `users`, `teams`, `workflows`, `workflow_states`, `workflow_transitions`, `item_types`, `labels` (firm-wide + visible projects): everyone.
-  * `projects`, `project_members`: project in `visible_project_ids(user)`.
-  * `work_items`: `can_view_item(user, id)`.
+  * `projects`, `project_members`: project in `select project_id from effective_roles where user_id = ?`.
+  * `work_items`: `exists (select 1 from visible_items where user_id = ? and item_id = ?)`.
   * `comments`, `relations` (either end visible), `work_item_labels`, `item_watchers`: parent item visible.
   * `views`: `owner_id = user` or (`is_shared` and project visible / null project).
   * `notifications`, `notification_preferences`: `user_id = user`.
@@ -850,7 +880,7 @@ POST   /api/v1/items/:key/watch ; DELETE /api/v1/items/:key/watch
 POST   /api/v1/items/bulk                     {ids|keys, patch}
 POST   /api/v1/items/bulk-transition          {ids|keys, transition_key} → {ok:[], failed:[{id, failures}]}
 
-GET    /api/v1/search                         ?q=&project=&limit → {items:[{...item, rank, snippet}]}
+GET    /api/v1/search                         ?q=&project=&limit → {items:[{...item, rank, snippet}]}   (FTS5 bm25 rank; LIKE fallback)
 GET    /api/v1/my-work                        → {assigned, created, watching, due_soon, mentions}   (used by MCP + palette)
 
 GET    /api/v1/types ; PUT /api/v1/types/:key (admin, upsertItemType)
@@ -949,128 +979,123 @@ delivery worker calls `renderNotification`/`renderDigest` and then
 
 ## 4. The database migration — `packages/db/migrations/0001_init.sql` (verbatim, complete)
 
-Create this file exactly. It is self-contained and applies to any Postgres
-15+ with `psql -f`. It defines every table, trigger, function, enum, index,
-the seeded `standard` and `simple` workflows, the `task`/`bug`/`initiative`/
-`request` item types, and the `work_items_v` view.
+Create this file exactly. It is self-contained and applies to any SQLite
+3.38+ with `sqlite3 pmtool.db < 0001_init.sql` (no extensions). It defines
+every table, trigger, view and index, the FTS5 table `work_items_fts`, the
+one-row `sync_state` counter and the per-table version triggers, the seeded
+`standard` and `simple` workflows and `task`/`bug`/`initiative`/`request`
+item types (fixed UUIDs), and the `work_items_v` view. Ids are UUID text,
+timestamps ISO-8601 UTC text, booleans 0/1, enums CHECK constraints, JSON
+columns text.
 
 ```sql
 -- ============================================================================
--- pm-tool :: core data model
+-- pm-tool :: core data model (SQLite)
 -- ----------------------------------------------------------------------------
--- This migration is intentionally self-contained: it can be applied to any
--- Postgres 15+ database with `psql -f` and used standalone, without the rest
--- of the monorepo.
+-- Self-contained: apply to any SQLite 3.38+ database (3.45+ recommended) with
+--   sqlite3 pmtool.db < 0001_init.sql
+-- and use standalone, without the rest of the monorepo. No extensions, no
+-- native modules, no server process. The application opens the file with
+-- Node's built-in `node:sqlite`.
 --
--- Design pillars (see docs/01-data-model.md):
---   1. One generic `work_item` entity with a `type` + validated JSONB `fields`.
+-- Conventions
+--   * ids are UUID strings (text); defaults generate a v4 UUID in SQL.
+--   * timestamps are ISO-8601 UTC text ("2026-10-21T04:55:21.249Z");
+--     dates are "YYYY-MM-DD" text. Both sort and compare correctly as text.
+--   * booleans are integer 0/1 with a CHECK; enums are text with a CHECK.
+--   * JSON columns are text validated with json_valid()/json_type().
+--   * arrays (scopes, event_kinds, allowed_type_ids, ...) are JSON arrays.
+--
+-- Design pillars (see docs/01-data-model.md)
+--   1. One generic `work_items` entity with a `type_id` + validated JSON `fields`.
 --   2. Workflows are DATA: states + transitions + guards + effects per workflow.
 --   3. Relations are one typed edge table (parent/child, blocks, duplicates,
 --      external links). Rollups and dependency checks are graph queries.
---   4. Activity log is append-only, one row per field change. UPDATE/DELETE on
---      it is physically blocked by a trigger.
---   5. Permissions: per-project roles (RBAC) + firm role + project visibility,
---      evaluated by one function. ABAC hooks live in workflow guards, not ACLs.
+--   4. Activity log is append-only, one row per field change; UPDATE/DELETE
+--      are blocked by triggers.
+--   5. Permissions: per-project roles + firm role + project visibility,
+--      exposed as views (effective_roles, visible_items).
 --   6. Views are saved queries (`views.spec`), not screens.
---   7. Every synced table carries `version` (global version for sync pulls)
---      and uses soft-delete tombstones so clients can converge.
+--   7. Every synced table carries `version` (global version stamped by
+--      triggers from `sync_state`) and uses soft-delete tombstones.
+--
+-- Runtime pragmas (set by the application on every connection):
+--   PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;
 -- ============================================================================
 
-set client_min_messages = warning;
-
-create extension if not exists pgcrypto;
-create extension if not exists pg_trgm;
+PRAGMA foreign_keys = ON;
 
 -- ----------------------------------------------------------------------------
 -- 0. Sync plumbing (global version strategy)
 -- ----------------------------------------------------------------------------
--- Every row in a synced table gets `version = nextval('sync_version_seq')` on
--- insert/update via trigger. Clients pull `where version > :cookie`.
--- Writers that participate in sync take `pg_advisory_xact_lock(42)` so that
--- version order == commit order (see docs/02-design.md, "Sync").
-create sequence if not exists sync_version_seq as bigint start 1;
-
-create or replace function trg_set_version() returns trigger
-language plpgsql as $$
-begin
-  new.version := nextval('sync_version_seq');
-  if tg_op = 'UPDATE' then
-    new.updated_at := now();
-  end if;
-  return new;
-end $$;
-
--- Helper: install the version trigger on a table
-create or replace function install_sync_trigger(tbl regclass) returns void
-language plpgsql as $$
-begin
-  execute format('drop trigger if exists set_version on %s', tbl);
-  execute format('create trigger set_version before insert or update on %s for each row execute function trg_set_version()', tbl);
-end $$;
+-- One monotonically increasing counter. Triggers below stamp every inserted or
+-- updated row of a synced table with the next value. SQLite serialises writers
+-- (BEGIN IMMEDIATE), so version order == commit order without any extra lock.
+create table sync_state (
+  id       integer primary key check (id = 1),
+  version  integer not null default 0
+);
+insert into sync_state(id, version) values (1, 0);
 
 -- ----------------------------------------------------------------------------
 -- 1. Principals
 -- ----------------------------------------------------------------------------
-create type firm_role as enum ('owner', 'admin', 'member', 'guest');
-
 create table users (
-  id            uuid primary key default gen_random_uuid(),
+  id            text primary key default (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6)))),
   email         text not null,
   name          text not null,
   avatar_url    text,
-  firm_role     firm_role not null default 'member',
-  is_active     boolean not null default true,
-  is_service    boolean not null default false,   -- bots / integrations / agents
-  settings      jsonb not null default '{}'::jsonb,
-  version       bigint not null default 0,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  deleted_at    timestamptz
+  firm_role     text not null default 'member' check (firm_role in ('owner','admin','member','guest')),
+  is_active     integer not null default 1 check (is_active in (0,1)),
+  is_service    integer not null default 0 check (is_service in (0,1)),   -- bots / integrations / agents
+  settings      text not null default '{}' check (json_valid(settings) and json_type(settings) = 'object'),
+  version       integer not null default 0,
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  deleted_at    text
 );
 create unique index users_email_uq on users (lower(email)) where deleted_at is null;
-select install_sync_trigger('users');
 
 create table sessions (
-  id            uuid primary key default gen_random_uuid(),
-  user_id       uuid not null references users(id) on delete cascade,
+  id            text primary key default (lower(hex(randomblob(16)))),
+  user_id       text not null references users(id) on delete cascade,
   token_hash    text not null unique,
-  expires_at    timestamptz not null,
-  created_at    timestamptz not null default now(),
-  last_seen_at  timestamptz
+  expires_at    text not null,
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  last_seen_at  text
 );
 create index sessions_user_idx on sessions(user_id);
 
 create table api_keys (
-  id            uuid primary key default gen_random_uuid(),
-  user_id       uuid not null references users(id) on delete cascade,
+  id            text primary key default (lower(hex(randomblob(16)))),
+  user_id       text not null references users(id) on delete cascade,
   name          text not null,
   key_prefix    text not null,          -- first 8 chars, for display
   key_hash      text not null unique,   -- sha256 of full key
-  scopes        text[] not null default '{read,write}',
-  expires_at    timestamptz,
-  last_used_at  timestamptz,
-  created_at    timestamptz not null default now(),
-  revoked_at    timestamptz
+  scopes        text not null default '["read","write"]' check (json_valid(scopes) and json_type(scopes) = 'array'),
+  expires_at    text,
+  last_used_at  text,
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  revoked_at    text
 );
 create index api_keys_user_idx on api_keys(user_id);
 
 create table teams (
-  id            uuid primary key default gen_random_uuid(),
+  id            text primary key default (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6)))),
   key           text not null unique,   -- e.g. "RATES", "OPS"
   name          text not null,
   description   text,
-  version       bigint not null default 0,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  deleted_at    timestamptz
+  version       integer not null default 0,
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  deleted_at    text
 );
-select install_sync_trigger('teams');
 
 create table team_members (
-  team_id       uuid not null references teams(id) on delete cascade,
-  user_id       uuid not null references users(id) on delete cascade,
-  is_lead       boolean not null default false,
-  created_at    timestamptz not null default now(),
+  team_id       text not null references teams(id) on delete cascade,
+  user_id       text not null references users(id) on delete cascade,
+  is_lead       integer not null default 0 check (is_lead in (0,1)),
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   primary key (team_id, user_id)
 );
 
@@ -1078,41 +1103,37 @@ create table team_members (
 -- 2. Workflows (state machines as data)
 -- ----------------------------------------------------------------------------
 create table workflows (
-  id            uuid primary key default gen_random_uuid(),
+  id            text primary key default (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6)))),
   key           text not null unique,
   name          text not null,
   description   text,
-  version       bigint not null default 0,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  deleted_at    timestamptz
+  version       integer not null default 0,
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  deleted_at    text
 );
-select install_sync_trigger('workflows');
 
 -- Category lets generic UI/queries treat states uniformly across workflows
 -- (e.g. "show me everything not done" regardless of type).
-create type state_category as enum ('backlog', 'todo', 'in_progress', 'done', 'canceled');
-
 create table workflow_states (
-  id            uuid primary key default gen_random_uuid(),
-  workflow_id   uuid not null references workflows(id) on delete cascade,
+  id            text primary key default (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6)))),
+  workflow_id   text not null references workflows(id) on delete cascade,
   key           text not null,
   name          text not null,
-  category      state_category not null,
+  category      text not null check (category in ('backlog','todo','in_progress','done','canceled')),
   color         text,
   sort          integer not null default 0,
-  is_initial    boolean not null default false,
-  version       bigint not null default 0,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  deleted_at    timestamptz,
+  is_initial    integer not null default 0 check (is_initial in (0,1)),
+  version       integer not null default 0,
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  deleted_at    text,
   unique (workflow_id, key)
 );
-create unique index workflow_states_one_initial on workflow_states(workflow_id) where is_initial and deleted_at is null;
-select install_sync_trigger('workflow_states');
+create unique index workflow_states_one_initial on workflow_states(workflow_id) where is_initial = 1 and deleted_at is null;
 
 -- A transition with from_state_id = NULL is allowed from ANY state.
--- guards:  JSON array of guard specs evaluated by @pm/core workflow engine, e.g.
+-- guards:  JSON array of guard specs evaluated by the @pm/core workflow engine, e.g.
 --   [{"type":"require_field","field":"assignee_id"},
 --    {"type":"no_open_blockers"},
 --    {"type":"children_in_category","categories":["done","canceled"]},
@@ -1125,30 +1146,29 @@ select install_sync_trigger('workflow_states');
 --    {"type":"webhook","event":"item.transitioned"},
 --    {"type":"transition_parent_if","all_children_category":["done","canceled"],"to":"done"}]
 create table workflow_transitions (
-  id            uuid primary key default gen_random_uuid(),
-  workflow_id   uuid not null references workflows(id) on delete cascade,
+  id            text primary key default (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6)))),
+  workflow_id   text not null references workflows(id) on delete cascade,
   key           text not null,
   name          text not null,
-  from_state_id uuid references workflow_states(id) on delete cascade,
-  to_state_id   uuid not null references workflow_states(id) on delete cascade,
-  guards        jsonb not null default '[]'::jsonb check (jsonb_typeof(guards) = 'array'),
-  effects       jsonb not null default '[]'::jsonb check (jsonb_typeof(effects) = 'array'),
+  from_state_id text references workflow_states(id) on delete cascade,
+  to_state_id   text not null references workflow_states(id) on delete cascade,
+  guards        text not null default '[]' check (json_valid(guards) and json_type(guards) = 'array'),
+  effects       text not null default '[]' check (json_valid(effects) and json_type(effects) = 'array'),
   sort          integer not null default 0,
-  version       bigint not null default 0,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  deleted_at    timestamptz,
+  version       integer not null default 0,
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  deleted_at    text,
   unique (workflow_id, key)
 );
 create index workflow_transitions_from_idx on workflow_transitions(workflow_id, from_state_id);
-select install_sync_trigger('workflow_transitions');
 
 -- ----------------------------------------------------------------------------
--- 3. Item types (one generic entity, typed fields via registry + JSONB)
+-- 3. Item types (one generic entity, typed fields via registry + JSON)
 -- ----------------------------------------------------------------------------
 -- field_defs: JSON array describing the type-specific fields stored in
--- work_items.fields. Validated by trg_validate_item_fields (DB) and by the
--- zod schema generated from the same defs in @pm/core (app).
+-- work_items.fields. Validated by triggers (DB) and by the zod schema generated
+-- from the same defs in @pm/core (app).
 --   [{"key":"severity","label":"Severity","kind":"select",
 --     "options":[{"value":"s1","label":"S1"},...],"required":true},
 --    {"key":"desk","label":"Desk","kind":"text"},
@@ -1159,251 +1179,261 @@ select install_sync_trigger('workflow_transitions');
 -- kind ∈ text | long_text | number | bool | date | datetime | select |
 --        multi_select | user | url
 create table item_types (
-  id            uuid primary key default gen_random_uuid(),
+  id            text primary key default (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6)))),
   key           text not null unique,          -- "task", "bug", "initiative", "trade_idea"
   name          text not null,
   plural_name   text,
   icon          text,
   color         text,
   description   text,
-  workflow_id   uuid not null references workflows(id),
-  field_defs    jsonb not null default '[]'::jsonb check (jsonb_typeof(field_defs) = 'array'),
-  is_container  boolean not null default false,  -- can have children (epic/initiative)
+  workflow_id   text not null references workflows(id),
+  field_defs    text not null default '[]' check (json_valid(field_defs) and json_type(field_defs) = 'array'),
+  is_container  integer not null default 0 check (is_container in (0,1)),  -- can have children (epic/initiative)
   sort          integer not null default 0,
-  is_active     boolean not null default true,
-  version       bigint not null default 0,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  deleted_at    timestamptz
+  is_active     integer not null default 1 check (is_active in (0,1)),
+  version       integer not null default 0,
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  deleted_at    text
 );
-select install_sync_trigger('item_types');
 
 -- ----------------------------------------------------------------------------
 -- 4. Projects + membership (permissions backbone)
 -- ----------------------------------------------------------------------------
-create type project_visibility as enum ('firm', 'private');
-create type project_role as enum ('admin', 'editor', 'viewer');
-create type project_status as enum ('planned', 'active', 'paused', 'completed', 'archived');
-
 create table projects (
-  id            uuid primary key default gen_random_uuid(),
-  key           text not null unique,     -- "RATES", "ONB" → item keys RATES-12
+  id            text primary key default (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6)))),
+  key           text not null unique check (key glob '[A-Z]*' and key not glob '*[^A-Z0-9]*' and length(key) between 2 and 10),  -- "RATES" → item keys RATES-12
   name          text not null,
   description   text,
-  status        project_status not null default 'active',
-  visibility    project_visibility not null default 'firm',
-  lead_id       uuid references users(id),
-  team_id       uuid references teams(id),
+  status        text not null default 'active' check (status in ('planned','active','paused','completed','archived')),
+  visibility    text not null default 'firm' check (visibility in ('firm','private')),
+  lead_id       text references users(id),
+  team_id       text references teams(id),
   item_seq      integer not null default 0,   -- per-project item numbering
-  default_type_id uuid references item_types(id),
-  allowed_type_ids uuid[],                     -- null = all active types
-  settings      jsonb not null default '{}'::jsonb,
-  start_date    date,
-  target_date   date,
-  version       bigint not null default 0,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  archived_at   timestamptz,
-  deleted_at    timestamptz,
-  check (key ~ '^[A-Z][A-Z0-9]{1,9}$')
+  default_type_id text references item_types(id),
+  allowed_type_ids text check (allowed_type_ids is null or (json_valid(allowed_type_ids) and json_type(allowed_type_ids) = 'array')), -- null = all active types
+  settings      text not null default '{}' check (json_valid(settings) and json_type(settings) = 'object'),
+  start_date    text,
+  target_date   text,
+  version       integer not null default 0,
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  archived_at   text,
+  deleted_at    text
 );
-select install_sync_trigger('projects');
 
 create table project_members (
-  project_id    uuid not null references projects(id) on delete cascade,
-  user_id       uuid not null references users(id) on delete cascade,
-  role          project_role not null default 'editor',
-  version       bigint not null default 0,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  deleted_at    timestamptz,
+  project_id    text not null references projects(id) on delete cascade,
+  user_id       text not null references users(id) on delete cascade,
+  role          text not null default 'editor' check (role in ('admin','editor','viewer')),
+  version       integer not null default 0,
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  deleted_at    text,
   primary key (project_id, user_id)
 );
 create index project_members_user_idx on project_members(user_id);
-select install_sync_trigger('project_members');
 
 -- ----------------------------------------------------------------------------
 -- 5. Work items (the one generic entity)
 -- ----------------------------------------------------------------------------
+-- `number` and `key` are filled by the assign_item_number trigger right after
+-- insert when omitted (SQLite triggers cannot rewrite NEW before the row
+-- exists), which is why they are nullable at the column level.
 create table work_items (
-  id            uuid primary key default gen_random_uuid(),
-  project_id    uuid not null references projects(id),
-  type_id       uuid not null references item_types(id),
-  number        integer not null,                       -- per project; filled by trigger when omitted
-  key           text not null unique,                   -- "RATES-12" (denormalized for search/links)
+  id            text primary key default (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6)))),
+  project_id    text not null references projects(id),
+  type_id       text not null references item_types(id),
+  number        integer,                                 -- per project; filled by trigger when omitted
+  key           text,                                    -- "RATES-12" (denormalized for search/links)
   title         text not null check (length(title) between 1 and 500),
   description   text not null default '',               -- markdown
-  state_id      uuid not null references workflow_states(id),
-  priority      smallint not null default 0 check (priority between 0 and 4), -- 0 none,1 urgent..4 low
-  assignee_id   uuid references users(id),
-  reporter_id   uuid references users(id),
-  start_date    date,
-  due_date      date,
-  estimate      numeric(10,2),                           -- points/hours; unit per project settings
-  fields        jsonb not null default '{}'::jsonb check (jsonb_typeof(fields) = 'object'),
-  confidential  boolean not null default false,         -- visible to project admins + assignee + reporter + creator only
-  sort_order    double precision not null default 0,    -- manual ordering within a board column
-  search        tsvector generated always as (
-                  setweight(to_tsvector('english', coalesce(key, '')), 'A') ||
-                  setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
-                  setweight(to_tsvector('english', coalesce(description, '')), 'C')
-                ) stored,
-  version       bigint not null default 0,
-  created_by    uuid references users(id),
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  completed_at  timestamptz,
-  canceled_at   timestamptz,
-  archived_at   timestamptz,
-  deleted_at    timestamptz,
+  state_id      text not null references workflow_states(id),
+  priority      integer not null default 0 check (priority between 0 and 4), -- 0 none,1 urgent..4 low
+  assignee_id   text references users(id),
+  reporter_id   text references users(id),
+  start_date    text,
+  due_date      text,
+  estimate      real,                                    -- points/hours; unit per project settings
+  fields        text not null default '{}' check (json_valid(fields) and json_type(fields) = 'object'),
+  confidential  integer not null default 0 check (confidential in (0,1)),  -- visible to project admins + assignee + reporter + creator only
+  sort_order    real not null default 0,                 -- manual ordering within a board column
+  version       integer not null default 0,
+  created_by    text references users(id),
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  completed_at  text,
+  canceled_at   text,
+  archived_at   text,
+  deleted_at    text,
   unique (project_id, number)
 );
+create unique index work_items_key_uq on work_items(key);
 create index work_items_project_state_idx on work_items(project_id, state_id) where deleted_at is null;
 create index work_items_assignee_idx on work_items(assignee_id) where deleted_at is null;
 create index work_items_type_idx on work_items(type_id) where deleted_at is null;
 create index work_items_due_idx on work_items(due_date) where deleted_at is null and due_date is not null;
-create index work_items_search_idx on work_items using gin(search);
-create index work_items_fields_idx on work_items using gin(fields jsonb_path_ops);
-create index work_items_title_trgm_idx on work_items using gin(title gin_trgm_ops);
 create index work_items_version_idx on work_items(version);
-select install_sync_trigger('work_items');
 
--- Assign per-project number + key on insert
-create or replace function trg_assign_item_number() returns trigger
-language plpgsql as $$
-declare pkey text;
+-- Full-text search: an FTS5 index over key/title/description, kept in sync by
+-- triggers. Query with:  select id from work_items_fts where work_items_fts match ?
+-- Rank with bm25(work_items_fts, 0.0, 10.0, 5.0, 1.0): one weight per column INCLUDING the
+-- unindexed id (id, key, title, description); lower is better.
+create virtual table work_items_fts using fts5(
+  id unindexed, key, title, description,
+  tokenize = 'porter unicode61'
+);
+
+-- AFTER INSERT triggers fire most-recently-created first, so assign_item_number
+-- (below) may already have re-indexed this row through work_items_fts_au;
+-- delete first so an item never has two FTS rows.
+create trigger work_items_fts_ai after insert on work_items begin
+  delete from work_items_fts where id = new.id;
+  insert into work_items_fts(id, key, title, description)
+    select id, coalesce(key, ''), title, description from work_items where id = new.id;
+end;
+create trigger work_items_fts_au after update of key, title, description on work_items begin
+  delete from work_items_fts where id = old.id;
+  insert into work_items_fts(id, key, title, description) values (new.id, coalesce(new.key,''), new.title, new.description);
+end;
+create trigger work_items_fts_ad after delete on work_items begin
+  delete from work_items_fts where id = old.id;
+end;
+
+-- Assign per-project number + key on insert (when omitted)
+create trigger assign_item_number after insert on work_items
+when new.number is null or new.number = 0 or new.key is null
 begin
-  if new.number is null or new.number = 0 then
-    update projects set item_seq = item_seq + 1 where id = new.project_id
-      returning item_seq, key into new.number, pkey;
-  else
-    select key into pkey from projects where id = new.project_id;
-  end if;
-  new.key := pkey || '-' || new.number;
-  return new;
-end $$;
--- BEFORE ROW triggers run before NOT NULL/UNIQUE checks, so the trigger may fill `number`.
-create trigger assign_item_number before insert on work_items
-  for each row execute function trg_assign_item_number();
+  update projects set item_seq = item_seq + 1 where id = new.project_id and (new.number is null or new.number = 0);
+  update work_items
+     set number = case when new.number is null or new.number = 0 then (select item_seq from projects where id = new.project_id) else new.number end,
+         key    = (select key from projects where id = new.project_id) || '-' ||
+                  case when new.number is null or new.number = 0 then (select item_seq from projects where id = new.project_id) else new.number end
+   where rowid = new.rowid;
+end;
 
--- Validate `fields` JSONB against item_types.field_defs (shape + required).
+-- Validate `fields` against item_types.field_defs (unknown keys, required, kinds).
 -- Deep validation (option membership, user existence) happens in @pm/core.
-create or replace function trg_validate_item_fields() returns trigger
-language plpgsql as $$
-declare
-  def jsonb;
-  k text;
-  kind text;
-  v jsonb;
-  defs jsonb;
-begin
-  select field_defs into defs from item_types where id = new.type_id;
-  if defs is null then
-    raise exception 'unknown item type %', new.type_id;
-  end if;
-  -- unknown keys are rejected: keeps JSONB honest
-  for k in select jsonb_object_keys(new.fields) loop
-    if not exists (select 1 from jsonb_array_elements(defs) d where d->>'key' = k) then
-      raise exception 'field "%" is not defined for this item type', k using errcode = '23514';
-    end if;
-  end loop;
-  for def in select * from jsonb_array_elements(defs) loop
-    k := def->>'key';
-    kind := def->>'kind';
-    v := new.fields -> k;
-    if coalesce((def->>'required')::boolean, false) and (v is null or v = 'null'::jsonb) then
-      raise exception 'field "%" is required', k using errcode = '23514';
-    end if;
-    if v is null or v = 'null'::jsonb then continue; end if;
-    if coalesce((def->>'multi')::boolean, false) or kind = 'multi_select' then
-      if jsonb_typeof(v) <> 'array' then
-        raise exception 'field "%" must be an array', k using errcode = '23514';
-      end if;
-      continue;
-    end if;
-    if kind in ('text','long_text','select','user','url','date','datetime') and jsonb_typeof(v) <> 'string' then
-      raise exception 'field "%" must be a string', k using errcode = '23514';
-    elsif kind = 'number' and jsonb_typeof(v) <> 'number' then
-      raise exception 'field "%" must be a number', k using errcode = '23514';
-    elsif kind = 'bool' and jsonb_typeof(v) <> 'boolean' then
-      raise exception 'field "%" must be a boolean', k using errcode = '23514';
-    end if;
-  end loop;
-  return new;
-end $$;
-create trigger validate_item_fields before insert or update of fields, type_id on work_items
-  for each row execute function trg_validate_item_fields();
+create trigger work_items_validate_fields_ins before insert on work_items begin
+  select raise(abort, 'unknown item type') where not exists (select 1 from item_types where id = new.type_id);
+  select raise(abort, 'field "' || k.key || '" is not defined for this item type')
+    from json_each(new.fields) k
+   where not exists (select 1 from json_each((select field_defs from item_types where id = new.type_id)) d where json_extract(d.value, '$.key') = k.key);
+  select raise(abort, 'field "' || json_extract(d.value, '$.key') || '" is required')
+    from json_each((select field_defs from item_types where id = new.type_id)) d
+   where json_extract(d.value, '$.required') = 1 and json_extract(new.fields, '$.' || json_extract(d.value, '$.key')) is null;
+  select raise(abort, 'field "' || json_extract(d.value, '$.key') || '" must be an array')
+    from json_each((select field_defs from item_types where id = new.type_id)) d
+   where (json_extract(d.value, '$.multi') = 1 or json_extract(d.value, '$.kind') = 'multi_select')
+     and json_type(new.fields, '$.' || json_extract(d.value, '$.key')) not in ('array', 'null')
+     and json_type(new.fields, '$.' || json_extract(d.value, '$.key')) is not null;
+  select raise(abort, 'field "' || json_extract(d.value, '$.key') || '" must be a string')
+    from json_each((select field_defs from item_types where id = new.type_id)) d
+   where json_extract(d.value, '$.multi') is not 1 and json_extract(d.value, '$.kind') in ('text','long_text','select','user','url','date','datetime')
+     and json_type(new.fields, '$.' || json_extract(d.value, '$.key')) not in ('text', 'null')
+     and json_type(new.fields, '$.' || json_extract(d.value, '$.key')) is not null;
+  select raise(abort, 'field "' || json_extract(d.value, '$.key') || '" must be a number')
+    from json_each((select field_defs from item_types where id = new.type_id)) d
+   where json_extract(d.value, '$.multi') is not 1 and json_extract(d.value, '$.kind') = 'number'
+     and json_type(new.fields, '$.' || json_extract(d.value, '$.key')) not in ('integer', 'real', 'null')
+     and json_type(new.fields, '$.' || json_extract(d.value, '$.key')) is not null;
+  select raise(abort, 'field "' || json_extract(d.value, '$.key') || '" must be a boolean')
+    from json_each((select field_defs from item_types where id = new.type_id)) d
+   where json_extract(d.value, '$.multi') is not 1 and json_extract(d.value, '$.kind') = 'bool'
+     and json_type(new.fields, '$.' || json_extract(d.value, '$.key')) not in ('true', 'false', 'null')
+     and json_type(new.fields, '$.' || json_extract(d.value, '$.key')) is not null;
+end;
+create trigger work_items_validate_fields_upd before update of fields, type_id on work_items begin
+  select raise(abort, 'unknown item type') where not exists (select 1 from item_types where id = new.type_id);
+  select raise(abort, 'field "' || k.key || '" is not defined for this item type')
+    from json_each(new.fields) k
+   where not exists (select 1 from json_each((select field_defs from item_types where id = new.type_id)) d where json_extract(d.value, '$.key') = k.key);
+  select raise(abort, 'field "' || json_extract(d.value, '$.key') || '" is required')
+    from json_each((select field_defs from item_types where id = new.type_id)) d
+   where json_extract(d.value, '$.required') = 1 and json_extract(new.fields, '$.' || json_extract(d.value, '$.key')) is null;
+  select raise(abort, 'field "' || json_extract(d.value, '$.key') || '" must be an array')
+    from json_each((select field_defs from item_types where id = new.type_id)) d
+   where (json_extract(d.value, '$.multi') = 1 or json_extract(d.value, '$.kind') = 'multi_select')
+     and json_type(new.fields, '$.' || json_extract(d.value, '$.key')) not in ('array', 'null')
+     and json_type(new.fields, '$.' || json_extract(d.value, '$.key')) is not null;
+  select raise(abort, 'field "' || json_extract(d.value, '$.key') || '" must be a string')
+    from json_each((select field_defs from item_types where id = new.type_id)) d
+   where json_extract(d.value, '$.multi') is not 1 and json_extract(d.value, '$.kind') in ('text','long_text','select','user','url','date','datetime')
+     and json_type(new.fields, '$.' || json_extract(d.value, '$.key')) not in ('text', 'null')
+     and json_type(new.fields, '$.' || json_extract(d.value, '$.key')) is not null;
+  select raise(abort, 'field "' || json_extract(d.value, '$.key') || '" must be a number')
+    from json_each((select field_defs from item_types where id = new.type_id)) d
+   where json_extract(d.value, '$.multi') is not 1 and json_extract(d.value, '$.kind') = 'number'
+     and json_type(new.fields, '$.' || json_extract(d.value, '$.key')) not in ('integer', 'real', 'null')
+     and json_type(new.fields, '$.' || json_extract(d.value, '$.key')) is not null;
+  select raise(abort, 'field "' || json_extract(d.value, '$.key') || '" must be a boolean')
+    from json_each((select field_defs from item_types where id = new.type_id)) d
+   where json_extract(d.value, '$.multi') is not 1 and json_extract(d.value, '$.kind') = 'bool'
+     and json_type(new.fields, '$.' || json_extract(d.value, '$.key')) not in ('true', 'false', 'null')
+     and json_type(new.fields, '$.' || json_extract(d.value, '$.key')) is not null;
+end;
 
 -- Enforce that state belongs to the item type's workflow
-create or replace function trg_validate_item_state() returns trigger
-language plpgsql as $$
-begin
-  if not exists (
-    select 1 from workflow_states s join item_types t on t.workflow_id = s.workflow_id
-    where s.id = new.state_id and t.id = new.type_id
-  ) then
-    raise exception 'state % does not belong to workflow of type %', new.state_id, new.type_id using errcode = '23514';
-  end if;
-  return new;
-end $$;
-create trigger validate_item_state before insert or update of state_id, type_id on work_items
-  for each row execute function trg_validate_item_state();
+create trigger work_items_validate_state_ins before insert on work_items begin
+  select raise(abort, 'state does not belong to the workflow of this item type')
+   where not exists (select 1 from workflow_states s join item_types t on t.workflow_id = s.workflow_id where s.id = new.state_id and t.id = new.type_id);
+end;
+create trigger work_items_validate_state_upd before update of state_id, type_id on work_items begin
+  select raise(abort, 'state does not belong to the workflow of this item type')
+   where not exists (select 1 from workflow_states s join item_types t on t.workflow_id = s.workflow_id where s.id = new.state_id and t.id = new.type_id);
+end;
 
 create table labels (
-  id            uuid primary key default gen_random_uuid(),
-  project_id    uuid references projects(id) on delete cascade, -- null = firm-wide label
+  id            text primary key default (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6)))),
+  project_id    text references projects(id) on delete cascade, -- null = firm-wide label
   name          text not null,
   color         text,
-  version       bigint not null default 0,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  deleted_at    timestamptz
+  version       integer not null default 0,
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  deleted_at    text
 );
-create unique index labels_name_uq on labels(coalesce(project_id, '00000000-0000-0000-0000-000000000000'::uuid), lower(name)) where deleted_at is null;
-select install_sync_trigger('labels');
+create unique index labels_name_uq on labels(coalesce(project_id, ''), lower(name)) where deleted_at is null;
 
 create table work_item_labels (
-  item_id       uuid not null references work_items(id) on delete cascade,
-  label_id      uuid not null references labels(id) on delete cascade,
-  version       bigint not null default 0,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  deleted_at    timestamptz,
+  item_id       text not null references work_items(id) on delete cascade,
+  label_id      text not null references labels(id) on delete cascade,
+  version       integer not null default 0,
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  deleted_at    text,
   primary key (item_id, label_id)
 );
-select install_sync_trigger('work_item_labels');
 
 create table comments (
-  id            uuid primary key default gen_random_uuid(),
-  item_id       uuid not null references work_items(id) on delete cascade,
-  author_id     uuid references users(id),
+  id            text primary key default (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6)))),
+  item_id       text not null references work_items(id) on delete cascade,
+  author_id     text references users(id),
   body          text not null,                       -- markdown; @mentions as @[name](user:uuid)
-  parent_id     uuid references comments(id),        -- threaded replies
+  parent_id     text references comments(id),        -- threaded replies
   source        text not null default 'app',         -- app | email | slack | github | mcp | api
-  external_ref  jsonb,                               -- e.g. slack ts, email message-id
-  version       bigint not null default 0,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  edited_at     timestamptz,
-  deleted_at    timestamptz
+  external_ref  text check (external_ref is null or json_valid(external_ref)),  -- e.g. slack ts, email message-id
+  version       integer not null default 0,
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  edited_at     text,
+  deleted_at    text
 );
 create index comments_item_idx on comments(item_id, created_at);
-select install_sync_trigger('comments');
 
 create table attachments (
-  id            uuid primary key default gen_random_uuid(),
-  item_id       uuid not null references work_items(id) on delete cascade,
+  id            text primary key default (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6)))),
+  item_id       text not null references work_items(id) on delete cascade,
   name          text not null,
   url           text not null,
   mime_type     text,
-  size_bytes    bigint,
-  created_by    uuid references users(id),
-  version       bigint not null default 0,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  deleted_at    timestamptz
+  size_bytes    integer,
+  created_by    text references users(id),
+  version       integer not null default 0,
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  deleted_at    text
 );
-select install_sync_trigger('attachments');
 
 -- ----------------------------------------------------------------------------
 -- 6. Relations: one typed edge table
@@ -1416,39 +1446,40 @@ create table relation_types (
   key           text primary key,
   name          text not null,          -- forward label  ("blocks")
   inverse_name  text not null,          -- inverse label  ("is blocked by")
-  is_hierarchy  boolean not null default false,
-  is_blocking   boolean not null default false,
-  is_symmetric  boolean not null default false,
+  is_hierarchy  integer not null default 0 check (is_hierarchy in (0,1)),
+  is_blocking   integer not null default 0 check (is_blocking in (0,1)),
+  is_symmetric  integer not null default 0 check (is_symmetric in (0,1)),
   sort          integer not null default 0
 );
 insert into relation_types (key, name, inverse_name, is_hierarchy, is_blocking, is_symmetric, sort) values
-  ('parent_of',  'parent of',  'child of',       true,  false, false, 0),
-  ('blocks',     'blocks',     'is blocked by',  false, true,  false, 1),
-  ('duplicates', 'duplicates', 'is duplicated by', false, false, true, 2),
-  ('relates_to', 'relates to', 'relates to',     false, false, true,  3),
-  ('links_to',   'links to',   'linked from',    false, false, false, 4); -- external entities
+  ('parent_of',  'parent of',  'child of',         1, 0, 0, 0),
+  ('blocks',     'blocks',     'is blocked by',    0, 1, 0, 1),
+  ('duplicates', 'duplicates', 'is duplicated by', 0, 0, 1, 2),
+  ('relates_to', 'relates to', 'relates to',       0, 0, 1, 3),
+  ('links_to',   'links to',   'linked from',      0, 0, 0, 4); -- external entities
 
 -- Edge: from_item -(type)-> to_item | external entity.
--- External entities (GitHub PR, Slack thread, email, document, Linear issue,
--- a row in another system) live in the same table with to_item_id = null and
+-- External entities (GitHub PR, Slack thread, email, document, a row in
+-- another system) live in the same table with to_item_id = null and
 -- external_kind/external_ref set, so "everything connected to this item" is
 -- one query.
 create table relations (
-  id            uuid primary key default gen_random_uuid(),
+  id            text primary key default (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6)))),
   type          text not null references relation_types(key),
-  from_item_id  uuid not null references work_items(id) on delete cascade,
-  to_item_id    uuid references work_items(id) on delete cascade,
+  from_item_id  text not null references work_items(id) on delete cascade,
+  to_item_id    text references work_items(id) on delete cascade,
   external_kind text,                                   -- github_pr | github_issue | slack_thread | email | url | doc | ...
-  external_ref  jsonb,                                  -- {"url":..., "repo":..., "number":..., "title":...}
+  external_ref  text check (external_ref is null or json_valid(external_ref)),  -- {"url":..., "repo":..., "number":..., "title":...}
   external_key  text generated always as (
-                  case when external_kind is not null then external_kind || ':' || coalesce(external_ref->>'id', external_ref->>'url', '') end
-                ) stored,
-  meta          jsonb not null default '{}'::jsonb,
-  created_by    uuid references users(id),
-  version       bigint not null default 0,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  deleted_at    timestamptz,
+                  case when external_kind is not null
+                       then external_kind || ':' || coalesce(json_extract(external_ref, '$.id'), json_extract(external_ref, '$.url'), '')
+                  end) stored,
+  meta          text not null default '{}' check (json_valid(meta) and json_type(meta) = 'object'),
+  created_by    text references users(id),
+  version       integer not null default 0,
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  deleted_at    text,
   check ((to_item_id is not null and external_kind is null and external_ref is null)
       or (to_item_id is null and external_kind is not null and external_ref is not null)),
   check (to_item_id is null or to_item_id <> from_item_id)
@@ -1457,114 +1488,107 @@ create unique index relations_item_edge_uq on relations(type, from_item_id, to_i
 create unique index relations_external_edge_uq on relations(type, from_item_id, external_key) where external_key is not null and deleted_at is null;
 create index relations_from_idx on relations(from_item_id) where deleted_at is null;
 create index relations_to_idx on relations(to_item_id) where deleted_at is null;
-create index relations_external_idx on relations(external_kind, (external_ref->>'url')) where deleted_at is null;
+create index relations_external_idx on relations(external_kind, json_extract(external_ref, '$.url')) where deleted_at is null;
 -- single parent in the hierarchy
 create unique index relations_single_parent_uq on relations(to_item_id) where type = 'parent_of' and deleted_at is null;
-select install_sync_trigger('relations');
 
--- Prevent cycles in hierarchy and blocking graphs; reject reverse duplicates of symmetric edges.
-create or replace function trg_relations_no_cycle() returns trigger
-language plpgsql as $$
-declare rt relation_types%rowtype; found boolean;
+-- Reject reverse duplicates of symmetric edges; prevent cycles in hierarchy and blocking graphs.
+create trigger relations_no_cycle_ins before insert on relations
+when new.to_item_id is not null and new.deleted_at is null
 begin
-  if new.to_item_id is null or new.deleted_at is not null then return new; end if;
-  select * into rt from relation_types where key = new.type;
-  -- symmetric types (duplicates, relates_to): the reverse edge is the same edge
-  if rt.is_symmetric and exists (
-       select 1 from relations r where r.type = new.type and r.from_item_id = new.to_item_id
-         and r.to_item_id = new.from_item_id and r.deleted_at is null and r.id <> new.id) then
-    raise exception 'relation % between % and % already exists (symmetric)', new.type, new.to_item_id, new.from_item_id using errcode = '23505';
-  end if;
-  if not (rt.is_hierarchy or rt.is_blocking) then return new; end if;
-  -- is there already a path to_item -> ... -> from_item of the same type?
-  with recursive walk(item_id, depth) as (
-    select new.to_item_id, 0
+  select raise(abort, 'symmetric relation already exists in the other direction')
+   where (select is_symmetric from relation_types where key = new.type) = 1
+     and exists (select 1 from relations r where r.type = new.type and r.from_item_id = new.to_item_id and r.to_item_id = new.from_item_id and r.deleted_at is null);
+  select raise(abort, 'relation would create a cycle')
+   where (select is_hierarchy = 1 or is_blocking = 1 from relation_types where key = new.type)
+     and exists (
+       with recursive walk(item_id, depth) as (
+         select new.to_item_id, 0
+         union all
+         select r.to_item_id, w.depth + 1 from relations r join walk w on r.from_item_id = w.item_id
+          where r.type = new.type and r.deleted_at is null and w.depth < 1000
+       )
+       select 1 from walk where item_id = new.from_item_id);
+end;
+create trigger relations_no_cycle_upd before update of from_item_id, to_item_id, type, deleted_at on relations
+when new.to_item_id is not null and new.deleted_at is null
+begin
+  select raise(abort, 'symmetric relation already exists in the other direction')
+   where (select is_symmetric from relation_types where key = new.type) = 1
+     and exists (select 1 from relations r where r.type = new.type and r.from_item_id = new.to_item_id and r.to_item_id = new.from_item_id and r.deleted_at is null and r.id <> new.id);
+  select raise(abort, 'relation would create a cycle')
+   where (select is_hierarchy = 1 or is_blocking = 1 from relation_types where key = new.type)
+     and exists (
+       with recursive walk(item_id, depth) as (
+         select new.to_item_id, 0
+         union all
+         select r.to_item_id, w.depth + 1 from relations r join walk w on r.from_item_id = w.item_id
+          where r.type = new.type and r.deleted_at is null and r.id <> new.id and w.depth < 1000
+       )
+       select 1 from walk where item_id = new.from_item_id);
+end;
+
+-- Graph helpers (views; SQLite has no SQL functions) -------------------------
+-- Direct parent of each item
+create view item_parents as
+  select r.to_item_id as item_id, r.from_item_id as parent_id
+    from relations r where r.type = 'parent_of' and r.deleted_at is null;
+
+-- Every (ancestor, descendant) pair with depth, through parent_of
+create view item_ancestry as
+  with recursive a(ancestor_id, item_id, depth) as (
+    select r.from_item_id, r.to_item_id, 1 from relations r where r.type = 'parent_of' and r.deleted_at is null
     union all
-    select r.to_item_id, w.depth + 1
-    from relations r join walk w on r.from_item_id = w.item_id
-    where r.type = new.type and r.deleted_at is null and w.depth < 1000
+    select a.ancestor_id, r.to_item_id, a.depth + 1
+      from relations r join a on r.from_item_id = a.item_id
+     where r.type = 'parent_of' and r.deleted_at is null and a.depth < 100
   )
-  select exists(select 1 from walk where item_id = new.from_item_id) into found;
-  if found then
-    raise exception 'relation % from % to % would create a cycle', new.type, new.from_item_id, new.to_item_id using errcode = '23514';
-  end if;
-  return new;
-end $$;
-create trigger relations_no_cycle before insert or update on relations
-  for each row execute function trg_relations_no_cycle();
+  select ancestor_id, item_id, depth from a;
 
--- Graph helpers (used by API + rollups) ------------------------------------
--- All descendants of an item through parent_of
-create or replace function item_descendants(root uuid) returns table(item_id uuid, depth int)
-language sql stable as $$
-  with recursive d(item_id, depth) as (
-    select r.to_item_id, 1 from relations r where r.from_item_id = root and r.type = 'parent_of' and r.deleted_at is null
-    union all
-    select r.to_item_id, d.depth + 1 from relations r join d on r.from_item_id = d.item_id
-    where r.type = 'parent_of' and r.deleted_at is null and d.depth < 100
-  ) select * from d
-$$;
+-- Open blockers: (blocked item, blocker) where the blocker is not done/canceled
+create view open_blockers as
+  select r.to_item_id as item_id, r.from_item_id as blocker_id
+    from relations r
+    join work_items b on b.id = r.from_item_id and b.deleted_at is null
+    join workflow_states s on s.id = b.state_id
+   where r.type = 'blocks' and r.deleted_at is null and s.category not in ('done', 'canceled');
 
--- Ancestors chain (parent, grandparent, ...)
-create or replace function item_ancestors(leaf uuid) returns table(item_id uuid, depth int)
-language sql stable as $$
-  with recursive a(item_id, depth) as (
-    select r.from_item_id, 1 from relations r where r.to_item_id = leaf and r.type = 'parent_of' and r.deleted_at is null
-    union all
-    select r.from_item_id, a.depth + 1 from relations r join a on r.to_item_id = a.item_id
-    where r.type = 'parent_of' and r.deleted_at is null and a.depth < 100
-  ) select * from a
-$$;
-
--- Open blockers: items that block `item` (directly) and are not done/canceled
-create or replace function item_open_blockers(item uuid) returns setof uuid
-language sql stable as $$
-  select r.from_item_id
-  from relations r
-  join work_items b on b.id = r.from_item_id and b.deleted_at is null
-  join workflow_states s on s.id = b.state_id
-  where r.to_item_id = item and r.type = 'blocks' and r.deleted_at is null
-    and s.category not in ('done', 'canceled')
-$$;
-
--- Rollup over a subtree: counts by category + estimate sums
-create or replace function item_rollup(root uuid)
-returns table(total int, done int, in_progress int, todo int, canceled int, estimate_total numeric, estimate_done numeric)
-language sql stable as $$
-  select count(*)::int,
-         count(*) filter (where s.category = 'done')::int,
-         count(*) filter (where s.category = 'in_progress')::int,
-         count(*) filter (where s.category in ('todo','backlog'))::int,
-         count(*) filter (where s.category = 'canceled')::int,
-         coalesce(sum(w.estimate), 0),
-         coalesce(sum(w.estimate) filter (where s.category = 'done'), 0)
-  from item_descendants(root) d
-  join work_items w on w.id = d.item_id and w.deleted_at is null
-  join workflow_states s on s.id = w.state_id
-$$;
+-- Rollup over each subtree: counts by category + estimate sums
+--   select * from item_rollups where root_id = ?
+create view item_rollups as
+  select a.ancestor_id as root_id,
+         count(*) as total,
+         sum(case when s.category = 'done' then 1 else 0 end) as done,
+         sum(case when s.category = 'in_progress' then 1 else 0 end) as in_progress,
+         sum(case when s.category in ('todo','backlog') then 1 else 0 end) as todo,
+         sum(case when s.category = 'canceled' then 1 else 0 end) as canceled,
+         coalesce(sum(w.estimate), 0) as estimate_total,
+         coalesce(sum(case when s.category = 'done' then w.estimate end), 0) as estimate_done
+    from item_ancestry a
+    join work_items w on w.id = a.item_id and w.deleted_at is null
+    join workflow_states s on s.id = w.state_id
+   group by a.ancestor_id;
 
 -- ----------------------------------------------------------------------------
 -- 7. Activity log: append-only, one event per field change
 -- ----------------------------------------------------------------------------
-create type actor_kind as enum ('user', 'api_key', 'integration', 'system', 'agent');
-
 create table activity_events (
-  id            bigint generated always as identity primary key,  -- monotonic cursor
-  txn_id        uuid not null,                     -- groups events from one mutation (undo unit)
+  id            integer primary key autoincrement,  -- monotonic cursor
+  txn_id        text not null,                     -- groups events from one mutation (undo unit)
   entity_type   text not null,                     -- work_item | comment | relation | project | view | label | ...
-  entity_id     uuid not null,
-  item_id       uuid,                              -- denormalized: the work item this touches (for timelines)
-  project_id    uuid,                              -- denormalized: for scoping/permissions
-  actor_kind    actor_kind not null default 'user',
-  actor_id      uuid,                              -- users.id (also for api_key/agent: the owning user)
+  entity_id     text not null,
+  item_id       text,                              -- denormalized: the work item this touches (for timelines)
+  project_id    text,                              -- denormalized: for scoping/permissions
+  actor_kind    text not null default 'user' check (actor_kind in ('user','api_key','integration','system','agent')),
+  actor_id      text,                              -- users.id (also for api_key/agent: the owning user)
   actor_label   text,                              -- "github", "slack", api key name, agent name
   action        text not null,                     -- create | update | delete | restore | transition | relation_add | relation_remove | comment | ...
   field         text,                              -- "title", "state_id", "fields.severity", null for create/delete
-  old_value     jsonb,
-  new_value     jsonb,
+  old_value     text check (old_value is null or json_valid(old_value)),   -- JSON
+  new_value     text check (new_value is null or json_valid(new_value)),   -- JSON
   mutation_name text,                              -- client mutator / API op that produced it
   source        text not null default 'app',       -- app | api | mcp | slack | email | github | system
-  created_at    timestamptz not null default now()
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 create index activity_item_idx on activity_events(item_id, id) where item_id is not null;
 create index activity_project_idx on activity_events(project_id, id);
@@ -1574,16 +1598,12 @@ create index activity_txn_idx on activity_events(txn_id);
 create index activity_created_idx on activity_events(created_at);
 
 -- Physically block mutation of history.
-create or replace function trg_append_only() returns trigger
-language plpgsql as $$
-begin
-  raise exception 'activity_events is append-only (% denied)', tg_op using errcode = '42501';
-end $$;
-create trigger activity_events_append_only before update or delete on activity_events
-  for each row execute function trg_append_only();
--- Also block TRUNCATE
-create trigger activity_events_no_truncate before truncate on activity_events
-  for each statement execute function trg_append_only();
+create trigger activity_events_no_update before update on activity_events begin
+  select raise(abort, 'activity_events is append-only (UPDATE denied)');
+end;
+create trigger activity_events_no_delete before delete on activity_events begin
+  select raise(abort, 'activity_events is append-only (DELETE denied)');
+end;
 
 -- ----------------------------------------------------------------------------
 -- 8. Views as saved queries
@@ -1602,95 +1622,84 @@ create trigger activity_events_no_truncate before truncate on activity_events
 --     "timeline":{"start_field":"start_date","end_field":"due_date"},
 --     "dashboard":{"widgets":[{"title":"Open by assignee","viz":"bar","group_by":"assignee_id","measure":"count"}]}
 --   }
-create type view_kind as enum ('list', 'board', 'timeline', 'dashboard');
-
 create table views (
-  id            uuid primary key default gen_random_uuid(),
-  project_id    uuid references projects(id) on delete cascade,  -- null = cross-project
-  owner_id      uuid references users(id),                        -- null = system/shared default
+  id            text primary key default (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6)))),
+  project_id    text references projects(id) on delete cascade,  -- null = cross-project
+  owner_id      text references users(id),                        -- null = system/shared default
   name          text not null,
-  kind          view_kind not null default 'list',
-  spec          jsonb not null default '{}'::jsonb check (jsonb_typeof(spec) = 'object'),
-  is_shared     boolean not null default false,                   -- visible to all project members
-  is_default    boolean not null default false,
+  kind          text not null default 'list' check (kind in ('list','board','timeline','dashboard')),
+  spec          text not null default '{}' check (json_valid(spec) and json_type(spec) = 'object'),
+  is_shared     integer not null default 0 check (is_shared in (0,1)),   -- visible to all project members
+  is_default    integer not null default 0 check (is_default in (0,1)),
   icon          text,
   sort          integer not null default 0,
-  version       bigint not null default 0,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  deleted_at    timestamptz
+  version       integer not null default 0,
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  deleted_at    text
 );
 create index views_project_idx on views(project_id) where deleted_at is null;
 create index views_owner_idx on views(owner_id) where deleted_at is null;
-select install_sync_trigger('views');
 
 -- ----------------------------------------------------------------------------
 -- 9. Watchers + notifications (low-noise by construction)
 -- ----------------------------------------------------------------------------
-create type watch_reason as enum ('assignee', 'reporter', 'mention', 'commenter', 'manual');
-
 create table item_watchers (
-  item_id       uuid not null references work_items(id) on delete cascade,
-  user_id       uuid not null references users(id) on delete cascade,
-  reason        watch_reason not null,
-  muted         boolean not null default false,
-  version       bigint not null default 0,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  deleted_at    timestamptz,
+  item_id       text not null references work_items(id) on delete cascade,
+  user_id       text not null references users(id) on delete cascade,
+  reason        text not null check (reason in ('assignee','reporter','mention','commenter','manual')),
+  muted         integer not null default 0 check (muted in (0,1)),
+  version       integer not null default 0,
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  deleted_at    text,
   primary key (item_id, user_id)
 );
-select install_sync_trigger('item_watchers');
-
-create type notify_channel as enum ('in_app', 'email', 'slack');
-create type notify_cadence as enum ('immediate', 'hourly', 'daily', 'off');
 
 -- One row per (user, channel). `rules` selects which event kinds are worth a
 -- ping: default = mentions + assignments + replies + state changes on items you
 -- are assigned to. Everything else only appears in the activity feed.
 create table notification_preferences (
-  user_id       uuid not null references users(id) on delete cascade,
-  channel       notify_channel not null,
-  cadence       notify_cadence not null default 'immediate',
-  rules         jsonb not null default '{"mention":true,"assigned":true,"reply":true,"state_change_assigned":true,"state_change_watching":false,"comment_watching":false,"due_soon":true}'::jsonb,
-  quiet_hours   jsonb,                       -- {"start":"19:00","end":"07:00","tz":"America/New_York"}
-  version       bigint not null default 0,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  deleted_at    timestamptz,
+  user_id       text not null references users(id) on delete cascade,
+  channel       text not null check (channel in ('in_app','email','slack')),
+  cadence       text not null default 'immediate' check (cadence in ('immediate','hourly','daily','off')),
+  rules         text not null default '{"mention":true,"assigned":true,"reply":true,"state_change_assigned":true,"state_change_watching":false,"comment_watching":false,"due_soon":true}' check (json_valid(rules) and json_type(rules) = 'object'),
+  quiet_hours   text check (quiet_hours is null or json_valid(quiet_hours)),   -- {"start":"19:00","end":"07:00","tz":"America/New_York"}
+  version       integer not null default 0,
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  deleted_at    text,
   primary key (user_id, channel)
 );
-select install_sync_trigger('notification_preferences');
 
 create table notifications (
-  id            uuid primary key default gen_random_uuid(),
-  user_id       uuid not null references users(id) on delete cascade,
-  item_id       uuid references work_items(id) on delete cascade,
-  event_id      bigint references activity_events(id),
-  kind          text not null,                -- mention | assigned | reply | state_change | due_soon | ...
+  id            text primary key default (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6)))),
+  user_id       text not null references users(id) on delete cascade,
+  item_id       text references work_items(id) on delete cascade,
+  event_id      integer references activity_events(id),
+  kind          text not null,                -- mention | assigned | reply | state_change | due_soon | mutation_rejected | ...
   title         text not null,
   body          text,
-  actor_id      uuid references users(id),
-  read_at       timestamptz,
-  archived_at   timestamptz,
-  version       bigint not null default 0,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  deleted_at    timestamptz
+  actor_id      text references users(id),
+  read_at       text,
+  archived_at   text,
+  version       integer not null default 0,
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  deleted_at    text
 );
 create index notifications_user_unread_idx on notifications(user_id, created_at desc) where read_at is null and deleted_at is null;
-select install_sync_trigger('notifications');
 
--- Outbound deliveries (email/slack) are collapsed per (user, item, window)
+-- Outbound deliveries (email/slack) are collapsed per (user, window)
 create table notification_deliveries (
-  id            bigint generated always as identity primary key,
-  user_id       uuid not null references users(id) on delete cascade,
-  channel       notify_channel not null,
-  notification_ids uuid[] not null,
-  scheduled_for timestamptz not null,
-  sent_at       timestamptz,
+  id            integer primary key autoincrement,
+  user_id       text not null references users(id) on delete cascade,
+  channel       text not null check (channel in ('in_app','email','slack')),
+  notification_ids text not null check (json_valid(notification_ids) and json_type(notification_ids) = 'array'),
+  scheduled_for text not null,
+  sent_at       text,
   error         text,
-  created_at    timestamptz not null default now()
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 create index notification_deliveries_pending_idx on notification_deliveries(scheduled_for) where sent_at is null;
 
@@ -1698,32 +1707,32 @@ create index notification_deliveries_pending_idx on notification_deliveries(sche
 -- 10. Integrations: webhooks out, inbound links
 -- ----------------------------------------------------------------------------
 create table webhook_endpoints (
-  id            uuid primary key default gen_random_uuid(),
+  id            text primary key default (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))),2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))),2) || '-' || lower(hex(randomblob(6)))),
   name          text not null,
   url           text not null,
   secret        text not null,                   -- HMAC-SHA256 of body in X-PM-Signature
-  event_kinds   text[] not null default '{*}',   -- e.g. {item.created,item.updated,item.transitioned,comment.created}
-  project_id    uuid references projects(id) on delete cascade,  -- null = all projects
-  is_active     boolean not null default true,
-  created_by    uuid references users(id),
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  deleted_at    timestamptz
+  event_kinds   text not null default '["*"]' check (json_valid(event_kinds) and json_type(event_kinds) = 'array'),  -- e.g. ["item.created","comment.created"]
+  project_id    text references projects(id) on delete cascade,  -- null = all projects
+  is_active     integer not null default 1 check (is_active in (0,1)),
+  created_by    text references users(id),
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  deleted_at    text
 );
 
 create table webhook_deliveries (
-  id            bigint generated always as identity primary key,
-  endpoint_id   uuid not null references webhook_endpoints(id) on delete cascade,
-  event_id      bigint not null references activity_events(id),
+  id            integer primary key autoincrement,
+  endpoint_id   text not null references webhook_endpoints(id) on delete cascade,
+  event_id      integer not null references activity_events(id),
   event_kind    text not null,
-  payload       jsonb not null,
-  status        text not null default 'pending',     -- pending | delivered | failed | dead
+  payload       text not null check (json_valid(payload)),
+  status        text not null default 'pending' check (status in ('pending','delivered','failed','dead')),
   attempts      integer not null default 0,
-  next_attempt_at timestamptz not null default now(),
-  last_attempt_at timestamptz,
+  next_attempt_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  last_attempt_at text,
   response_status integer,
   response_body text,
-  created_at    timestamptz not null default now()
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 create index webhook_deliveries_pending_idx on webhook_deliveries(next_attempt_at) where status in ('pending','failed');
 
@@ -1733,17 +1742,17 @@ create index webhook_deliveries_pending_idx on webhook_deliveries(next_attempt_a
 --   email : {"inbound_domain": "pm.example.com"}
 create table integration_configs (
   kind          text primary key,                 -- slack | github | email
-  config        jsonb not null default '{}'::jsonb,
-  is_active     boolean not null default false,
-  updated_by    uuid references users(id),
-  updated_at    timestamptz not null default now()
+  config        text not null default '{}' check (json_valid(config) and json_type(config) = 'object'),
+  is_active     integer not null default 0 check (is_active in (0,1)),
+  updated_by    text references users(id),
+  updated_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 -- Idempotency for inbound events (Slack retries, GitHub redeliveries, email dupes)
 create table inbound_events (
   source        text not null,
   external_id   text not null,
-  received_at   timestamptz not null default now(),
+  received_at   text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   primary key (source, external_id)
 );
 
@@ -1752,154 +1761,305 @@ create table inbound_events (
 -- ----------------------------------------------------------------------------
 create table sync_client_groups (
   id            text primary key,
-  user_id       uuid not null references users(id) on delete cascade,
-  resync_required boolean not null default false,  -- set when the user's visibility changes
-  created_at    timestamptz not null default now(),
-  last_seen_at  timestamptz not null default now()
+  user_id       text not null references users(id) on delete cascade,
+  resync_required integer not null default 0 check (resync_required in (0,1)),  -- set when the user's visibility changes
+  created_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  last_seen_at  text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 create table sync_clients (
   id              text primary key,
   client_group_id text not null references sync_client_groups(id) on delete cascade,
   last_mutation_id integer not null default 0,
-  version         bigint not null default 0,      -- version at which last_mutation_id changed
-  created_at      timestamptz not null default now(),
-  last_seen_at    timestamptz not null default now()
+  version         integer not null default 0,      -- global version at which last_mutation_id changed
+  created_at      text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  last_seen_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 create index sync_clients_group_idx on sync_clients(client_group_id);
 
 -- ----------------------------------------------------------------------------
--- 12. Permissions: one function, used by API + sync pull + RLS-ready
+-- 12. Permissions as views (used by API + sync pull)
 -- ----------------------------------------------------------------------------
--- Effective project role for a user (null = no access).
-create or replace function effective_project_role(p_user uuid, p_project uuid) returns project_role
-language sql stable as $$
-  select coalesce(
-    (select pm.role from project_members pm where pm.user_id = p_user and pm.project_id = p_project and pm.deleted_at is null),
-    (select case
-              when u.firm_role in ('owner','admin') then 'admin'::project_role
-              when u.firm_role = 'member' and p.visibility = 'firm' then 'editor'::project_role
-              else null end
-     from users u, projects p where u.id = p_user and p.id = p_project and u.deleted_at is null and p.deleted_at is null)
-  )
-  from users u0 where u0.id = p_user and u0.is_active and u0.deleted_at is null
-$$;
+-- Effective project role for every (active user, live project) pair that has
+-- access: explicit membership wins; else firm owner/admin → admin; else firm
+-- member on a firm-visible project → editor; guests only via membership.
+create view effective_roles as
+  select user_id, project_id, role from (
+    select u.id as user_id, p.id as project_id,
+           coalesce(pm.role,
+                    case when u.firm_role in ('owner','admin') then 'admin'
+                         when u.firm_role = 'member' and p.visibility = 'firm' then 'editor'
+                    end) as role
+      from users u
+      cross join projects p
+      left join project_members pm on pm.user_id = u.id and pm.project_id = p.id and pm.deleted_at is null
+     where u.deleted_at is null and u.is_active = 1 and p.deleted_at is null
+  ) where role is not null;
 
--- Can the user see this item? (membership/visibility + confidential flag)
-create or replace function can_view_item(p_user uuid, p_item uuid) returns boolean
-language sql stable as $$
-  select exists (
-    select 1 from work_items w
-    where w.id = p_item and w.deleted_at is null
-      and effective_project_role(p_user, w.project_id) is not null
-      and (not w.confidential
-           or w.assignee_id = p_user or w.reporter_id = p_user or w.created_by = p_user
-           or effective_project_role(p_user, w.project_id) = 'admin')
-  )
-$$;
-
--- Projects visible to a user (drives sync pull scope)
-create or replace function visible_project_ids(p_user uuid) returns setof uuid
-language sql stable as $$
-  select p.id from projects p
-  where p.deleted_at is null and effective_project_role(p_user, p.id) is not null
-$$;
+-- Items each user may see: project access + the confidential rule.
+--   exists (select 1 from visible_items vi where vi.user_id = ? and vi.item_id = w.id)
+create view visible_items as
+  select er.user_id, w.id as item_id
+    from work_items w
+    join effective_roles er on er.project_id = w.project_id
+   where w.deleted_at is null
+     and (w.confidential = 0
+          or w.assignee_id = er.user_id or w.reporter_id = er.user_id or w.created_by = er.user_id
+          or er.role = 'admin');
 
 -- ----------------------------------------------------------------------------
 -- 13. Firm-level settings
 -- ----------------------------------------------------------------------------
 create table settings (
   key           text primary key,
-  value         jsonb not null,
-  updated_at    timestamptz not null default now()
+  value         text not null check (json_valid(value)),
+  updated_at    text not null default (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 insert into settings(key, value) values
   ('firm', '{"name":"The Firm","item_key_prefix_style":"project"}'),
-  ('sync', '{"strategy":"global_version","advisory_lock_id":42}');
+  ('sync', '{"strategy":"global_version"}');
 
 -- ----------------------------------------------------------------------------
--- 14. Default workflow + item types (so the schema is usable immediately)
+-- 14. Sync version + updated_at triggers for every synced table
 -- ----------------------------------------------------------------------------
-do $$
-declare wf uuid; s_backlog uuid; s_todo uuid; s_prog uuid; s_review uuid; s_done uuid; s_cancel uuid;
-        wf_simple uuid; ss_todo uuid; ss_prog uuid; ss_done uuid; ss_cancel uuid;
-begin
-  -- Standard engineering/ops workflow
-  insert into workflows(key, name, description) values ('standard', 'Standard', 'Backlog → Todo → In Progress → In Review → Done') returning id into wf;
-  insert into workflow_states(workflow_id, key, name, category, color, sort, is_initial) values
-    (wf, 'backlog', 'Backlog', 'backlog', '#9ca3af', 0, false) returning id into s_backlog;
-  insert into workflow_states(workflow_id, key, name, category, color, sort, is_initial) values
-    (wf, 'todo', 'Todo', 'todo', '#60a5fa', 1, true) returning id into s_todo;
-  insert into workflow_states(workflow_id, key, name, category, color, sort, is_initial) values
-    (wf, 'in_progress', 'In Progress', 'in_progress', '#f59e0b', 2, false) returning id into s_prog;
-  insert into workflow_states(workflow_id, key, name, category, color, sort, is_initial) values
-    (wf, 'in_review', 'In Review', 'in_progress', '#a78bfa', 3, false) returning id into s_review;
-  insert into workflow_states(workflow_id, key, name, category, color, sort, is_initial) values
-    (wf, 'done', 'Done', 'done', '#10b981', 4, false) returning id into s_done;
-  insert into workflow_states(workflow_id, key, name, category, color, sort, is_initial) values
-    (wf, 'canceled', 'Canceled', 'canceled', '#6b7280', 5, false) returning id into s_cancel;
+-- Insert: stamp version with the next global value.
+-- Update: when the statement did not itself change `version` (i.e. an
+-- application write, not our own stamp), bump the counter, stamp the row and
+-- refresh updated_at. recursive_triggers is off by default, so the stamping
+-- UPDATE cannot re-fire the same trigger.
+create trigger users_version_ins after insert on users begin
+  update sync_state set version = version + 1 where id = 1;
+  update users set version = (select version from sync_state where id = 1) where rowid = new.rowid;
+end;
+create trigger users_version_upd after update on users when new.version = old.version begin
+  update sync_state set version = version + 1 where id = 1;
+  update users set version = (select version from sync_state where id = 1), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') where rowid = new.rowid;
+end;
 
-  insert into workflow_transitions(workflow_id, key, name, from_state_id, to_state_id, guards, effects, sort) values
-    (wf, 'triage',   'Triage',        s_backlog, s_todo,   '[]', '[]', 0),
-    (wf, 'start',    'Start',         null,      s_prog,   '[{"type":"require_field","field":"assignee_id"},{"type":"no_open_blockers"}]',
-                                                           '[{"type":"set_field","field":"start_date","value":"$today","only_if_null":true}]', 1),
-    (wf, 'review',   'Send to review', s_prog,   s_review, '[]', '[{"type":"notify","audience":["watchers"],"template":"review_requested"}]', 2),
-    (wf, 'reopen',   'Reopen',        s_review,  s_prog,   '[]', '[]', 3),
-    (wf, 'complete', 'Complete',      null,      s_done,   '[{"type":"children_in_category","categories":["done","canceled"]}]',
-                                                           '[{"type":"set_field","field":"completed_at","value":"$now"},{"type":"webhook","event":"item.completed"}]', 4),
-    (wf, 'cancel',   'Cancel',        null,      s_cancel, '[{"type":"require_role","roles":["admin","editor"]}]',
-                                                           '[{"type":"set_field","field":"canceled_at","value":"$now"}]', 5),
-    (wf, 'restore',  'Restore',       s_cancel,  s_todo,   '[]', '[{"type":"set_field","field":"canceled_at","value":null}]', 6),
-    (wf, 'backlog',  'Back to backlog', null,    s_backlog,'[]', '[{"type":"set_field","field":"completed_at","value":null}]', 7);
+create trigger teams_version_ins after insert on teams begin
+  update sync_state set version = version + 1 where id = 1;
+  update teams set version = (select version from sync_state where id = 1) where rowid = new.rowid;
+end;
+create trigger teams_version_upd after update on teams when new.version = old.version begin
+  update sync_state set version = version + 1 where id = 1;
+  update teams set version = (select version from sync_state where id = 1), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') where rowid = new.rowid;
+end;
 
-  -- Simple 3-state workflow for lightweight types
-  insert into workflows(key, name, description) values ('simple', 'Simple', 'Todo → Doing → Done') returning id into wf_simple;
-  insert into workflow_states(workflow_id, key, name, category, color, sort, is_initial) values
-    (wf_simple, 'todo', 'Todo', 'todo', '#60a5fa', 0, true) returning id into ss_todo;
-  insert into workflow_states(workflow_id, key, name, category, color, sort, is_initial) values
-    (wf_simple, 'doing', 'Doing', 'in_progress', '#f59e0b', 1, false) returning id into ss_prog;
-  insert into workflow_states(workflow_id, key, name, category, color, sort, is_initial) values
-    (wf_simple, 'done', 'Done', 'done', '#10b981', 2, false) returning id into ss_done;
-  insert into workflow_states(workflow_id, key, name, category, color, sort, is_initial) values
-    (wf_simple, 'canceled', 'Canceled', 'canceled', '#6b7280', 3, false) returning id into ss_cancel;
-  insert into workflow_transitions(workflow_id, key, name, from_state_id, to_state_id, guards, effects, sort) values
-    (wf_simple, 'start',    'Start',    null, ss_prog,   '[]', '[]', 0),
-    (wf_simple, 'complete', 'Complete', null, ss_done,   '[]', '[{"type":"set_field","field":"completed_at","value":"$now"}]', 1),
-    (wf_simple, 'cancel',   'Cancel',   null, ss_cancel, '[]', '[{"type":"set_field","field":"canceled_at","value":"$now"}]', 2),
-    (wf_simple, 'reopen',   'Reopen',   null, ss_todo,   '[]', '[{"type":"set_field","field":"completed_at","value":null},{"type":"set_field","field":"canceled_at","value":null}]', 3);
+create trigger workflows_version_ins after insert on workflows begin
+  update sync_state set version = version + 1 where id = 1;
+  update workflows set version = (select version from sync_state where id = 1) where rowid = new.rowid;
+end;
+create trigger workflows_version_upd after update on workflows when new.version = old.version begin
+  update sync_state set version = version + 1 where id = 1;
+  update workflows set version = (select version from sync_state where id = 1), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') where rowid = new.rowid;
+end;
 
-  insert into item_types(key, name, plural_name, icon, color, workflow_id, is_container, sort, field_defs) values
-    ('task', 'Task', 'Tasks', 'check-square', '#60a5fa', wf, false, 0, '[]'),
-    ('bug',  'Bug',  'Bugs',  'bug', '#ef4444', wf, false, 1,
-      '[{"key":"severity","label":"Severity","kind":"select","required":true,
-         "options":[{"value":"s1","label":"S1 – Critical"},{"value":"s2","label":"S2 – High"},{"value":"s3","label":"S3 – Medium"},{"value":"s4","label":"S4 – Low"}]},
-        {"key":"environment","label":"Environment","kind":"select",
-         "options":[{"value":"prod","label":"Production"},{"value":"uat","label":"UAT"},{"value":"dev","label":"Dev"}]},
-        {"key":"steps","label":"Steps to reproduce","kind":"long_text"}]'),
-    ('initiative', 'Initiative', 'Initiatives', 'flag', '#a78bfa', wf, true, 2,
-      '[{"key":"owner_desk","label":"Owning desk","kind":"text"},
-        {"key":"business_case","label":"Business case","kind":"long_text"},
-        {"key":"budget","label":"Budget (USD)","kind":"number"},
-        {"key":"quarter","label":"Target quarter","kind":"select",
-         "options":[{"value":"2026Q4","label":"2026 Q4"},{"value":"2027Q1","label":"2027 Q1"},{"value":"2027Q2","label":"2027 Q2"}]}]'),
-    ('request', 'Request', 'Requests', 'inbox', '#f59e0b', wf_simple, false, 3,
-      '[{"key":"requester_desk","label":"Requesting desk","kind":"text"},
-        {"key":"urgency","label":"Urgency","kind":"select",
-         "options":[{"value":"today","label":"Today"},{"value":"this_week","label":"This week"},{"value":"whenever","label":"Whenever"}]},
-        {"key":"approved","label":"Approved","kind":"bool"}]');
-end $$;
+create trigger workflow_states_version_ins after insert on workflow_states begin
+  update sync_state set version = version + 1 where id = 1;
+  update workflow_states set version = (select version from sync_state where id = 1) where rowid = new.rowid;
+end;
+create trigger workflow_states_version_upd after update on workflow_states when new.version = old.version begin
+  update sync_state set version = version + 1 where id = 1;
+  update workflow_states set version = (select version from sync_state where id = 1), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') where rowid = new.rowid;
+end;
+
+create trigger workflow_transitions_version_ins after insert on workflow_transitions begin
+  update sync_state set version = version + 1 where id = 1;
+  update workflow_transitions set version = (select version from sync_state where id = 1) where rowid = new.rowid;
+end;
+create trigger workflow_transitions_version_upd after update on workflow_transitions when new.version = old.version begin
+  update sync_state set version = version + 1 where id = 1;
+  update workflow_transitions set version = (select version from sync_state where id = 1), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') where rowid = new.rowid;
+end;
+
+create trigger item_types_version_ins after insert on item_types begin
+  update sync_state set version = version + 1 where id = 1;
+  update item_types set version = (select version from sync_state where id = 1) where rowid = new.rowid;
+end;
+create trigger item_types_version_upd after update on item_types when new.version = old.version begin
+  update sync_state set version = version + 1 where id = 1;
+  update item_types set version = (select version from sync_state where id = 1), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') where rowid = new.rowid;
+end;
+
+create trigger projects_version_ins after insert on projects begin
+  update sync_state set version = version + 1 where id = 1;
+  update projects set version = (select version from sync_state where id = 1) where rowid = new.rowid;
+end;
+create trigger projects_version_upd after update on projects when new.version = old.version begin
+  update sync_state set version = version + 1 where id = 1;
+  update projects set version = (select version from sync_state where id = 1), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') where rowid = new.rowid;
+end;
+
+create trigger project_members_version_ins after insert on project_members begin
+  update sync_state set version = version + 1 where id = 1;
+  update project_members set version = (select version from sync_state where id = 1) where rowid = new.rowid;
+end;
+create trigger project_members_version_upd after update on project_members when new.version = old.version begin
+  update sync_state set version = version + 1 where id = 1;
+  update project_members set version = (select version from sync_state where id = 1), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') where rowid = new.rowid;
+end;
+
+create trigger work_items_version_ins after insert on work_items begin
+  update sync_state set version = version + 1 where id = 1;
+  update work_items set version = (select version from sync_state where id = 1) where rowid = new.rowid;
+end;
+create trigger work_items_version_upd after update on work_items when new.version = old.version begin
+  update sync_state set version = version + 1 where id = 1;
+  update work_items set version = (select version from sync_state where id = 1), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') where rowid = new.rowid;
+end;
+
+create trigger labels_version_ins after insert on labels begin
+  update sync_state set version = version + 1 where id = 1;
+  update labels set version = (select version from sync_state where id = 1) where rowid = new.rowid;
+end;
+create trigger labels_version_upd after update on labels when new.version = old.version begin
+  update sync_state set version = version + 1 where id = 1;
+  update labels set version = (select version from sync_state where id = 1), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') where rowid = new.rowid;
+end;
+
+create trigger work_item_labels_version_ins after insert on work_item_labels begin
+  update sync_state set version = version + 1 where id = 1;
+  update work_item_labels set version = (select version from sync_state where id = 1) where rowid = new.rowid;
+end;
+create trigger work_item_labels_version_upd after update on work_item_labels when new.version = old.version begin
+  update sync_state set version = version + 1 where id = 1;
+  update work_item_labels set version = (select version from sync_state where id = 1), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') where rowid = new.rowid;
+end;
+
+create trigger comments_version_ins after insert on comments begin
+  update sync_state set version = version + 1 where id = 1;
+  update comments set version = (select version from sync_state where id = 1) where rowid = new.rowid;
+end;
+create trigger comments_version_upd after update on comments when new.version = old.version begin
+  update sync_state set version = version + 1 where id = 1;
+  update comments set version = (select version from sync_state where id = 1), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') where rowid = new.rowid;
+end;
+
+create trigger attachments_version_ins after insert on attachments begin
+  update sync_state set version = version + 1 where id = 1;
+  update attachments set version = (select version from sync_state where id = 1) where rowid = new.rowid;
+end;
+create trigger attachments_version_upd after update on attachments when new.version = old.version begin
+  update sync_state set version = version + 1 where id = 1;
+  update attachments set version = (select version from sync_state where id = 1), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') where rowid = new.rowid;
+end;
+
+create trigger relations_version_ins after insert on relations begin
+  update sync_state set version = version + 1 where id = 1;
+  update relations set version = (select version from sync_state where id = 1) where rowid = new.rowid;
+end;
+create trigger relations_version_upd after update on relations when new.version = old.version begin
+  update sync_state set version = version + 1 where id = 1;
+  update relations set version = (select version from sync_state where id = 1), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') where rowid = new.rowid;
+end;
+
+create trigger views_version_ins after insert on views begin
+  update sync_state set version = version + 1 where id = 1;
+  update views set version = (select version from sync_state where id = 1) where rowid = new.rowid;
+end;
+create trigger views_version_upd after update on views when new.version = old.version begin
+  update sync_state set version = version + 1 where id = 1;
+  update views set version = (select version from sync_state where id = 1), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') where rowid = new.rowid;
+end;
+
+create trigger item_watchers_version_ins after insert on item_watchers begin
+  update sync_state set version = version + 1 where id = 1;
+  update item_watchers set version = (select version from sync_state where id = 1) where rowid = new.rowid;
+end;
+create trigger item_watchers_version_upd after update on item_watchers when new.version = old.version begin
+  update sync_state set version = version + 1 where id = 1;
+  update item_watchers set version = (select version from sync_state where id = 1), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') where rowid = new.rowid;
+end;
+
+create trigger notification_preferences_version_ins after insert on notification_preferences begin
+  update sync_state set version = version + 1 where id = 1;
+  update notification_preferences set version = (select version from sync_state where id = 1) where rowid = new.rowid;
+end;
+create trigger notification_preferences_version_upd after update on notification_preferences when new.version = old.version begin
+  update sync_state set version = version + 1 where id = 1;
+  update notification_preferences set version = (select version from sync_state where id = 1), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') where rowid = new.rowid;
+end;
+
+create trigger notifications_version_ins after insert on notifications begin
+  update sync_state set version = version + 1 where id = 1;
+  update notifications set version = (select version from sync_state where id = 1) where rowid = new.rowid;
+end;
+create trigger notifications_version_upd after update on notifications when new.version = old.version begin
+  update sync_state set version = version + 1 where id = 1;
+  update notifications set version = (select version from sync_state where id = 1), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') where rowid = new.rowid;
+end;
 
 -- ----------------------------------------------------------------------------
--- 15. Convenience view: items with resolved display columns
+-- 15. Default workflows + item types (fixed ids so the schema is usable at once)
 -- ----------------------------------------------------------------------------
-create or replace view work_items_v as
+insert into workflows(id, key, name, description) values
+  ('00000000-0000-4000-8000-000000000a01', 'standard', 'Standard', 'Backlog → Todo → In Progress → In Review → Done'),
+  ('00000000-0000-4000-8000-000000000a02', 'simple',   'Simple',   'Todo → Doing → Done');
+
+insert into workflow_states(id, workflow_id, key, name, category, color, sort, is_initial) values
+  ('00000000-0000-4000-8000-000000000b01', '00000000-0000-4000-8000-000000000a01', 'backlog',     'Backlog',     'backlog',     '#9ca3af', 0, 0),
+  ('00000000-0000-4000-8000-000000000b02', '00000000-0000-4000-8000-000000000a01', 'todo',        'Todo',        'todo',        '#60a5fa', 1, 1),
+  ('00000000-0000-4000-8000-000000000b03', '00000000-0000-4000-8000-000000000a01', 'in_progress', 'In Progress', 'in_progress', '#f59e0b', 2, 0),
+  ('00000000-0000-4000-8000-000000000b04', '00000000-0000-4000-8000-000000000a01', 'in_review',   'In Review',   'in_progress', '#a78bfa', 3, 0),
+  ('00000000-0000-4000-8000-000000000b05', '00000000-0000-4000-8000-000000000a01', 'done',        'Done',        'done',        '#10b981', 4, 0),
+  ('00000000-0000-4000-8000-000000000b06', '00000000-0000-4000-8000-000000000a01', 'canceled',    'Canceled',    'canceled',    '#6b7280', 5, 0),
+  ('00000000-0000-4000-8000-000000000b11', '00000000-0000-4000-8000-000000000a02', 'todo',        'Todo',        'todo',        '#60a5fa', 0, 1),
+  ('00000000-0000-4000-8000-000000000b12', '00000000-0000-4000-8000-000000000a02', 'doing',       'Doing',       'in_progress', '#f59e0b', 1, 0),
+  ('00000000-0000-4000-8000-000000000b13', '00000000-0000-4000-8000-000000000a02', 'done',        'Done',        'done',        '#10b981', 2, 0),
+  ('00000000-0000-4000-8000-000000000b14', '00000000-0000-4000-8000-000000000a02', 'canceled',    'Canceled',    'canceled',    '#6b7280', 3, 0);
+
+insert into workflow_transitions(id, workflow_id, key, name, from_state_id, to_state_id, guards, effects, sort) values
+  ('00000000-0000-4000-8000-000000000c01', '00000000-0000-4000-8000-000000000a01', 'triage',   'Triage',          '00000000-0000-4000-8000-000000000b01', '00000000-0000-4000-8000-000000000b02', '[]', '[]', 0),
+  ('00000000-0000-4000-8000-000000000c02', '00000000-0000-4000-8000-000000000a01', 'start',    'Start',           null,                                   '00000000-0000-4000-8000-000000000b03',
+     '[{"type":"require_field","field":"assignee_id"},{"type":"no_open_blockers"}]',
+     '[{"type":"set_field","field":"start_date","value":"$today","only_if_null":true}]', 1),
+  ('00000000-0000-4000-8000-000000000c03', '00000000-0000-4000-8000-000000000a01', 'review',   'Send to review',  '00000000-0000-4000-8000-000000000b03', '00000000-0000-4000-8000-000000000b04', '[]', '[{"type":"notify","audience":["watchers"],"template":"review_requested"}]', 2),
+  ('00000000-0000-4000-8000-000000000c04', '00000000-0000-4000-8000-000000000a01', 'reopen',   'Reopen',          '00000000-0000-4000-8000-000000000b04', '00000000-0000-4000-8000-000000000b03', '[]', '[]', 3),
+  ('00000000-0000-4000-8000-000000000c05', '00000000-0000-4000-8000-000000000a01', 'complete', 'Complete',        null,                                   '00000000-0000-4000-8000-000000000b05',
+     '[{"type":"children_in_category","categories":["done","canceled"]}]',
+     '[{"type":"set_field","field":"completed_at","value":"$now"},{"type":"webhook","event":"item.completed"}]', 4),
+  ('00000000-0000-4000-8000-000000000c06', '00000000-0000-4000-8000-000000000a01', 'cancel',   'Cancel',          null,                                   '00000000-0000-4000-8000-000000000b06',
+     '[{"type":"require_role","roles":["admin","editor"]}]',
+     '[{"type":"set_field","field":"canceled_at","value":"$now"}]', 5),
+  ('00000000-0000-4000-8000-000000000c07', '00000000-0000-4000-8000-000000000a01', 'restore',  'Restore',         '00000000-0000-4000-8000-000000000b06', '00000000-0000-4000-8000-000000000b02', '[]', '[{"type":"set_field","field":"canceled_at","value":null}]', 6),
+  ('00000000-0000-4000-8000-000000000c08', '00000000-0000-4000-8000-000000000a01', 'backlog',  'Back to backlog', null,                                   '00000000-0000-4000-8000-000000000b01', '[]', '[{"type":"set_field","field":"completed_at","value":null}]', 7),
+  ('00000000-0000-4000-8000-000000000c11', '00000000-0000-4000-8000-000000000a02', 'start',    'Start',           null, '00000000-0000-4000-8000-000000000b12', '[]', '[]', 0),
+  ('00000000-0000-4000-8000-000000000c12', '00000000-0000-4000-8000-000000000a02', 'complete', 'Complete',        null, '00000000-0000-4000-8000-000000000b13', '[]', '[{"type":"set_field","field":"completed_at","value":"$now"}]', 1),
+  ('00000000-0000-4000-8000-000000000c13', '00000000-0000-4000-8000-000000000a02', 'cancel',   'Cancel',          null, '00000000-0000-4000-8000-000000000b14', '[]', '[{"type":"set_field","field":"canceled_at","value":"$now"}]', 2),
+  ('00000000-0000-4000-8000-000000000c14', '00000000-0000-4000-8000-000000000a02', 'reopen',   'Reopen',          null, '00000000-0000-4000-8000-000000000b11', '[]', '[{"type":"set_field","field":"completed_at","value":null},{"type":"set_field","field":"canceled_at","value":null}]', 3);
+
+insert into item_types(id, key, name, plural_name, icon, color, workflow_id, is_container, sort, field_defs) values
+  ('00000000-0000-4000-8000-000000000d01', 'task', 'Task', 'Tasks', 'check-square', '#60a5fa', '00000000-0000-4000-8000-000000000a01', 0, 0, '[]'),
+  ('00000000-0000-4000-8000-000000000d02', 'bug',  'Bug',  'Bugs',  'bug', '#ef4444', '00000000-0000-4000-8000-000000000a01', 0, 1,
+    '[{"key":"severity","label":"Severity","kind":"select","required":true,
+       "options":[{"value":"s1","label":"S1 – Critical"},{"value":"s2","label":"S2 – High"},{"value":"s3","label":"S3 – Medium"},{"value":"s4","label":"S4 – Low"}]},
+      {"key":"environment","label":"Environment","kind":"select",
+       "options":[{"value":"prod","label":"Production"},{"value":"uat","label":"UAT"},{"value":"dev","label":"Dev"}]},
+      {"key":"steps","label":"Steps to reproduce","kind":"long_text"}]'),
+  ('00000000-0000-4000-8000-000000000d03', 'initiative', 'Initiative', 'Initiatives', 'flag', '#a78bfa', '00000000-0000-4000-8000-000000000a01', 1, 2,
+    '[{"key":"owner_desk","label":"Owning desk","kind":"text"},
+      {"key":"business_case","label":"Business case","kind":"long_text"},
+      {"key":"budget","label":"Budget (USD)","kind":"number"},
+      {"key":"quarter","label":"Target quarter","kind":"select",
+       "options":[{"value":"2026Q4","label":"2026 Q4"},{"value":"2027Q1","label":"2027 Q1"},{"value":"2027Q2","label":"2027 Q2"}]}]'),
+  ('00000000-0000-4000-8000-000000000d04', 'request', 'Request', 'Requests', 'inbox', '#f59e0b', '00000000-0000-4000-8000-000000000a02', 0, 3,
+    '[{"key":"requester_desk","label":"Requesting desk","kind":"text"},
+      {"key":"urgency","label":"Urgency","kind":"select",
+       "options":[{"value":"today","label":"Today"},{"value":"this_week","label":"This week"},{"value":"whenever","label":"Whenever"}]},
+      {"key":"approved","label":"Approved","kind":"bool"}]');
+
+-- ----------------------------------------------------------------------------
+-- 16. Convenience view: items with resolved display columns
+-- ----------------------------------------------------------------------------
+-- label_names is a JSON array; is_blocked is 0/1.
+create view work_items_v as
 select w.*,
        t.key  as type_key, t.name as type_name,
        s.key  as state_key, s.name as state_name, s.category as state_category,
        p.key  as project_key, p.name as project_name,
        a.name as assignee_name,
-       (select array_agg(l.name order by l.name) from work_item_labels wl join labels l on l.id = wl.label_id where wl.item_id = w.id and wl.deleted_at is null) as label_names,
+       (select json_group_array(name) from (select l.name from work_item_labels wl join labels l on l.id = wl.label_id where wl.item_id = w.id and wl.deleted_at is null and l.deleted_at is null order by l.name)) as label_names,
        (select r.from_item_id from relations r where r.to_item_id = w.id and r.type = 'parent_of' and r.deleted_at is null) as parent_id,
-       exists(select 1 from item_open_blockers(w.id)) as is_blocked
+       exists(select 1 from open_blockers ob where ob.item_id = w.id) as is_blocked
 from work_items w
 join item_types t on t.id = w.type_id
 join workflow_states s on s.id = w.state_id
@@ -2267,7 +2427,7 @@ import { StateCategory, ViewKind } from '../schema/entities.js';
  *   "state.category" | "state.key"       (via workflow_states)
  *   "type.key"                           (via item_types)
  *   "project.key"                        (via projects)
- *   "fields.<key>"                       (JSONB type-specific field)
+ *   "fields.<key>"                       (JSON type-specific field)
  *   "labels"                             (array of label ids; ops: has / has_any / has_all / is_empty)
  *   "parent_id"                          (derived from relations parent_of)
  *   "is_blocked"                         (derived: has open blockers)
@@ -2374,7 +2534,7 @@ export interface QueryContext {
 /** Result of compiling a QuerySpec to SQL (server side). */
 export interface CompiledQuery {
   text: string;            // SELECT ... FROM work_items_v w ... WHERE ... ORDER BY ... LIMIT ...
-  values: unknown[];       // positional params ($1..$n)
+  values: unknown[];       // positional `?` params, in order (plain SQLite scalars)
   /** For group_by queries: SELECT <group>, count(*), ... */
   isAggregate: boolean;
 }
@@ -2620,7 +2780,7 @@ export interface WorkflowEngine {
 // ============================================================================
 // Permissions contract. DECISION: per-project roles (RBAC) + firm role +
 // project visibility. One pure function decides everything; the DB mirrors it
-// in effective_project_role()/can_view_item() for sync-pull scoping.
+// in the effective_roles/visible_items views for sync-pull scoping.
 // Attribute-style conditions belong in workflow guards, not here.
 // ============================================================================
 import type { FirmRole, ProjectRole, ProjectVisibility } from '../schema/entities.js';
@@ -2739,19 +2899,30 @@ import type { FieldDef } from '../schema/entities.js';
 export interface CompileOptions {
   /** Base relation; default "work_items_v w" (has state_category, type_key, label ids etc.) */
   from?: string;
-  /** Field defs by item type key, to type JSONB fields (fields.<key>) correctly */
+  /** Field defs by item type key, to encode JSON fields (fields.<key>) correctly */
   fieldDefs?: Record<string, FieldDef[]>;
-  /** Extra WHERE fragments already parameterized, e.g. permission scope. */
+  /** Extra WHERE fragments already parameterized (`?` placeholders), e.g. permission scope. */
   extraWhere?: { text: string; values: unknown[] }[];
   select?: string; // default "w.*"
 }
-/** Compile a QuerySpec to parameterized SQL over work_items_v. */
+/** Compile a QuerySpec to parameterized SQLite SQL over work_items_v (`?` placeholders, values in order). */
 export function compileQuery(spec: QuerySpec, ctx: QueryContext, opts?: CompileOptions): CompiledQuery;
-/** Compile a dashboard widget into an aggregate query (group_by + measure). */
+/** Compile a dashboard widget into an aggregate query (group_by + measure; time buckets in UTC via strftime, weeks start Monday). */
 export function compileWidget(widget: Widget, ctx: QueryContext, opts?: CompileOptions): CompiledQuery;
-/** Build the permission-scope WHERE fragment for a user (mirrors can_view_item). */
-export function visibilityWhere(userId: string, paramOffset: number): { text: string; values: unknown[] };
+/** Permission-scope WHERE fragment: exists (select 1 from visible_items vi where vi.user_id = ? and vi.item_id = w.id). */
+export function visibilityWhere(userId: string): { text: string; values: unknown[] };
 ```
+
+SQL shapes the compiler must emit: `fields.<key>` → `json_extract(w.fields, '$.<key>')`
+(multi kinds via `json_each`); `labels` → `exists (select 1 from work_item_labels …)`;
+`search match` → a join on `w.id` against the FTS hit set
+`(select id, bm25(work_items_fts, 10.0, 5.0, 1.0) as rank from work_items_fts where work_items_fts match ?)`,
+deduplicated by `id` (the FTS table can hold two entries per item, see the
+migration's trigger order) and ordered by `rank`; `contains`/`starts_with` →
+`like` with escaped patterns; booleans bound as 0/1; `nin` keeps NULL rows.
+FTS5 auxiliary functions (`bm25`, `snippet`) are only legal in the query that
+holds the `MATCH`, so compute them in a `with hits as materialized (…)` CTE
+and aggregate outside it.
 
 `packages/core/src/query/evaluate.ts` (client-side evaluator):
 
@@ -2830,13 +3001,13 @@ export const EVENT_KINDS = [
   'project.created', 'project.updated',
 ] as const;
 export type EventKind = (typeof EVENT_KINDS)[number];
-/** Fields of work_items that are tracked one-event-per-field in the activity log (JSONB fields are tracked per key as "fields.<key>"). */
+/** Fields of work_items that are tracked one-event-per-field in the activity log (JSON fields are tracked per key as "fields.<key>"). */
 export const TRACKED_ITEM_FIELDS: (keyof WorkItem)[] = [
   'title', 'description', 'type_id', 'state_id', 'priority', 'assignee_id', 'reporter_id', 'start_date', 'due_date',
   'estimate', 'confidential', 'archived_at', 'project_id', 'sort_order',
 ];
 export type FieldChange = { field: string; old: unknown; new: unknown };
-/** Diff two item snapshots into one change per field (JSONB fields expanded to "fields.<key>"). */
+/** Diff two item snapshots into one change per field (JSON fields expanded to "fields.<key>"). */
 export function diffItem(before: Partial<WorkItem>, after: Partial<WorkItem>): FieldChange[];
 /** Map an activity event to the webhook event kind it represents (or null if internal). */
 export function eventKindOf(e: Pick<ActivityEvent, 'entity_type' | 'action' | 'field'>): EventKind | null;
@@ -2952,56 +3123,104 @@ Each phase ends with its tests green and a commit.
 
 ### Phase 1 — `@pm/db`
 
-Files: `migrations/0001_init.sql` (§4, verbatim), `src/migrate.ts`,
-`src/seed.ts`, `src/reset.ts`, `src/index.ts` (exports `migrate(databaseUrl)`,
-`seed(databaseUrl)`), `src/*.test.ts`.
+Files: `migrations/0001_init.sql` (§4, verbatim), `src/sqlite.ts` (the
+runtime layer), `src/client.ts`, `src/migrate.ts`, `src/seed.ts`,
+`src/reset.ts`, `src/index.ts` (re-exports everything below plus
+`connect()`, `databaseUrl()`, `databasePath()`), `src/*.test.ts`. The package
+depends on nothing but `node:sqlite` (and `tsx` to run scripts).
 
-* `migrate.ts`: creates `schema_migrations(filename text primary key, applied_at
-  timestamptz)` if missing, applies every `migrations/*.sql` not yet recorded
-  in filename order, each inside one transaction, using the `postgres` driver
-  (`sql.unsafe`/`sql.file`). Idempotent. Exits non-zero on error.
-* `reset.ts`: `drop schema public cascade; create schema public;` then migrate
-  and seed. Refuses when `NODE_ENV=production`.
-* `seed.ts`: implements §8 using plain SQL inserts (it may import nothing from
-  other packages). Idempotent: skips when `users` already has `alice@firm.com`.
+* `sqlite.ts`: `openDb(pathOrUrl?, opts?)` resolves the path
+  (`resolveDbPath`: `:memory:`, `sqlite:`/`file:` prefixes, absolute, or
+  relative to the repo root found via `pnpm-workspace.yaml`; default
+  `./data/pmtool.db`; creates the directory), opens a `DatabaseSync`, sets
+  `pragma busy_timeout = 5000`, `journal_mode = WAL` (file databases),
+  `foreign_keys = ON`, `synchronous = NORMAL`, registers SQL functions
+  `now()`, `uuid()`, `gen_random_uuid()`, `today()`, and returns a `Sql`:
+  a tagged template (`sql\`select … where id = ${id}\``) that compiles to
+  `?` placeholders, is thenable (returns hydrated rows) and has sync
+  accessors `.all()`, `.get()`, `.run()`; `sql(list)` → `(?, ?, ?)`
+  (empty → `(null)`); `sql.raw(text)`, `sql.unsafe(text, params)`,
+  `sql.json(v)`; nested fragments splice with their params. Params:
+  booleans → 0/1, objects/arrays → JSON text, `Date` → ISO, `undefined` →
+  null. Rows: `hydrateRow` parses `JSON_COLUMNS` (and `*_json` aliases) and
+  turns 0/1 in `BOOLEAN_COLUMNS` (and `is_*`) into booleans; export
+  `registerJsonColumns`/`registerBooleanColumns`. Transactions:
+  `sql.begin(fn)` = `BEGIN IMMEDIATE` behind an async mutex, statements in
+  the same async context (AsyncLocalStorage) join it, nested `begin` →
+  `SAVEPOINT`; `sql.snapshot(fn)` = `BEGIN DEFERRED`; `sql.savepoint(fn)`;
+  `sql.exec(text)` for multi-statement scripts; `sql.nextVersion()` /
+  `sql.currentVersion()` on `sync_state`; `sql.inTransaction`, `sql.path`,
+  `sql.db`, `sql.close()`. `sqliteErrorKind(e)` → `'unique' | 'check' |
+  'foreign_key' | 'not_null' | 'trigger' | 'busy' | 'other'` from the
+  extended errcode (2067, 275, 787, 1299, 1811, 5/6).
+* `migrate.ts`: `runMigrations(sql, { dir?, log? })` creates
+  `schema_migrations(name text primary key, applied_at text)` if missing;
+  inside one `sql.begin`, if no migration is recorded but `work_items`
+  exists, records the first file as **adopted** (schema applied out of band
+  with `sqlite3`); then applies every `migrations/*.sql` not yet recorded in
+  filename order with `tx.exec(text)` and records it. Returns
+  `{ applied, skipped, adopted }`. The CLI (`tsx src/migrate.ts`) prints the
+  database path and the summary; exits non-zero on error.
+* `reset.ts`: `reset(url?)` refuses unless `isLocalDatabaseUrl(url)` (a
+  plain file path or `:memory:`; never a URL) and the CLI was given `--yes`;
+  deletes the file and its `-wal`/`-shm` siblings, then migrates and seeds.
+* `seed.ts`: `seed(sql, { force?, now?, log? })` implements §8 through the
+  `sql` tag inside one `sql.begin` (it may import nothing from other
+  packages). Idempotent: returns `null` when any user exists unless `force`.
+  Remember `RETURNING` shows `number`/`key`/`version` before the triggers
+  run: read rows back when the seed needs keys.
 
-**Tests (`src/db.test.ts`, require `DATABASE_URL`; create a temporary database
-`pmtool_test_<random>` and drop it after):**
+**Tests (`src/*.test.ts`; each opens `openDb(':memory:')` or a file under
+`os.tmpdir()` and runs `runMigrations`):**
 
-1. Migration applies on an empty database without error; running `migrate`
-   twice is a no-op.
+1. Migration applies on an empty database without error; running
+   `runMigrations` twice is a no-op (`skipped` lists it); a database created
+   with `sql.exec(readFileSync('0001_init.sql'))` is **adopted** on the first
+   run.
 2. `insert into work_items` without `number` yields `number = 1`, `key =
-   'RATES-1'`; the second item gets `RATES-2`; `projects.item_seq` is 2.
-3. `trg_validate_item_fields`: unknown key rejected (`23514`); missing
-   required `severity` on a `bug` rejected; wrong type (`severity: 1`)
-   rejected; a valid bug inserts.
-4. `trg_validate_item_state`: a `task` with a `simple`-workflow state is
+   'RATES-1'` when read back; the second item gets `RATES-2`;
+   `projects.item_seq` is 2; `RETURNING` returned null for both.
+3. Field validation triggers: unknown key rejected (`sqliteErrorKind` =
+   `'trigger'`, message names the field); missing required `severity` on a
+   `bug` rejected; wrong type (`severity: 1`) rejected; a valid bug inserts.
+4. State validation triggers: a `task` with a `simple`-workflow state is
    rejected.
-5. Relations: self-edge rejected; duplicate (type, from, to) rejected; second
-   parent rejected (unique index); `blocks` cycle A→B→C→A rejected with the
-   cycle message; `parent_of` cycle rejected; `relates_to` cycle allowed;
-   external edge requires `external_kind` + `external_ref` and forbids
-   `to_item_id`; `external_key` is generated as `github_pr:<url>`.
-6. `item_descendants` / `item_ancestors` depths; `item_open_blockers` ignores
-   done/canceled blockers and deleted items; `item_rollup` counts and
-   estimate sums.
-7. `activity_events`: UPDATE, DELETE and TRUNCATE each raise `42501`.
-8. `effective_project_role` matrix: explicit member row wins over firm role;
-   firm owner/admin → admin everywhere; member on firm project → editor;
-   member on private project → null; guest without row → null; deleted
-   membership ignored. `can_view_item`: confidential visible to admin,
-   assignee, reporter, creator; not to another editor. `visible_project_ids`.
-9. `trg_set_version`: `version` strictly increases across inserts/updates on
-   two different tables; `updated_at` changes on update.
+5. Relations: self-edge rejected (`check`); duplicate (type, from, to)
+   rejected (`unique`); second parent rejected (unique index); `blocks`
+   cycle A→B→C→A rejected with `relation would create a cycle`;
+   `parent_of` cycle rejected; `relates_to` reverse duplicate rejected with
+   the symmetric message; external edge requires `external_kind` +
+   `external_ref` and forbids `to_item_id`; `external_key` is generated as
+   `github_pr:<url>`.
+6. Views: `item_ancestry` depths; `open_blockers` ignores done/canceled
+   blockers and deleted items; `item_rollups` counts and estimate sums.
+7. `activity_events`: UPDATE and DELETE each raise the append-only message.
+8. `effective_roles` matrix: explicit member row wins over firm role; firm
+   owner/admin → admin everywhere; member on firm project → editor; member
+   on private project → no row; guest without row → no row; deleted
+   membership ignored. `visible_items`: confidential visible to admin,
+   assignee, reporter, creator; not to another editor.
+9. Version triggers: `version` strictly increases across inserts/updates on
+   two different tables and equals `sync_state.version` after each;
+   `updated_at` changes on update.
 10. `work_items_v` exposes `type_key`, `state_category`, `project_key`,
-    `assignee_name`, `label_names`, `parent_id`, `is_blocked`.
-11. Seed: after `seed()`, counts match §8 and every seeded view's `spec`
-    parses with `ViewSpec` (import from `@pm/core` **in the test only**).
+    `assignee_name`, `label_names` (hydrated to an array), `parent_id`,
+    `is_blocked` (hydrated to a boolean).
+11. `work_items_fts`: a title word matches with `match`, ranking puts a key
+    hit first, an update re-indexes, a delete removes the row.
+12. Runtime: `sql(list)` renders `(?, ?)`; booleans bind as 0/1 and read
+    back as booleans; JSON columns round-trip; nested `begin` is a savepoint
+    that rolls back alone; two concurrent `begin` calls serialise;
+    `snapshot` sees a consistent state while a `begin` is pending.
+13. Seed: after `seed()`, counts match §8 and every seeded view's `spec`
+    parses with `ViewSpec` (import from `@pm/core` **in the test only**);
+    `seed()` again returns `null`; `seed(sql, { force: true })` reseeds.
 
 ### Phase 2 — `@pm/core`
 
 Files per §5. Pure: no Node-only imports, no I/O (the parity test is the only
-file that touches Postgres and it lives in `src/query/parity.test.ts`).
+file that touches a database, an in-memory SQLite opened through `@pm/db`
+as a dev dependency, and it lives in `src/query/parity.test.ts`).
 
 **Tests:**
 
@@ -3027,23 +3246,24 @@ file that touches Postgres and it lives in `src/query/parity.test.ts`).
   each role; confidential rule; `*_own`; `firm_admin`; inactive user; `assert`
   throws `PermissionError` with `status 403`).
 * `query/compile.test.ts`: for every `FilterOp` on a representative field the
-  SQL text contains the expected fragment and `values` are positional
-  (`$1..$n`), no string interpolation of values; `fields.<key>` casts by
-  kind; `labels has` → `EXISTS`; `search match` → `websearch_to_tsquery`;
-  macros resolved; `sort` with `nulls`; `group_by` → `isAggregate`;
-  `extraWhere` appended; `limit/offset`; `include_archived`; `compileWidget`
-  for each `Measure`/`time_bucket`.
+  SQL text contains the expected fragment and `values` are positional `?`
+  placeholders in order, no string interpolation of values; `fields.<key>`
+  → `json_extract` (multi kinds → `json_each`); `labels has` → `EXISTS`;
+  `search match` → `work_items_fts match` with `bm25` ordering; macros
+  resolved; `sort` with `nulls`; `group_by` → `isAggregate`; `extraWhere`
+  appended (`visibilityWhere` → `exists (select 1 from visible_items …)`);
+  `limit/offset`; `include_archived`; `compileWidget` for each
+  `Measure`/`time_bucket` (UTC `strftime`, weeks start Monday).
 * `query/evaluate.test.ts`: every op against in-memory rows, dotted refs via
   lookups, macros with injected `now` and `tz`, sort stability and nulls,
   grouping labels (state name, assignee id, field option label).
-* `query/parity.test.ts` (**SQL ↔ local parity**, skips when `DATABASE_URL`
-  is unreachable): load a fixture of ≥ 30 items across 2 projects, 3 types,
-  labels, parent/blocks relations and varied dates/fields into a temporary
-  database (apply §4 first); define ≥ 40 specs covering every op, dotted
-  refs, macros, `and/or/not` nesting, sorts with nulls and `group_by`;
-  for each spec assert `compileQuery` executed against Postgres and
-  `runSpec` over the same rows return **identical ordered id lists** and
-  identical group keys.
+* `query/parity.test.ts` (**SQL ↔ local parity**): load a fixture of ≥ 30
+  items across 2 projects, 3 types, labels, parent/blocks relations and
+  varied dates/fields into `openDb(':memory:')` with §4 applied; define ≥ 40
+  specs covering every op, dotted refs, macros, `and/or/not` nesting, sorts
+  with nulls and `group_by`; for each spec assert `compileQuery` executed
+  against SQLite and `runSpec` over the same (hydrated) rows return
+  **identical ordered id lists** and identical group keys.
 * `events.test.ts`: `diffItem` yields one change per changed tracked field
   and `fields.<key>` entries, ignores unchanged and absent fields, treats
   `undefined` and `null` as equal; `eventKindOf` maps `work_item/create` →
@@ -3063,22 +3283,29 @@ protocol, auth, the mutation pipeline, workers and search.
 
 Structure (suggested): `src/server.ts` (boot), `src/app.ts` (`buildApp(opts)`
 returns a Fastify instance without listening — tests use `app.inject`),
-`src/db.ts` (`postgres` client, `withTxn(fn)` that runs `select
-pg_advisory_xact_lock(42)` first), `src/auth.ts` (cookie + bearer →
-`Actor`), `src/mutations/apply.ts` (`applyMutation(tx, actor, mutation,
-meta)` implementing the 8 steps of §3 "Mutations"), `src/mutations/<name>.ts`
-one per mutation, `src/activity.ts` (diff → rows), `src/notify.ts`
-(rules, collapsing, deliveries), `src/webhooks.ts` (enqueue + dispatcher
-loop), `src/sync/{push,pull,poke}.ts`, `src/routes/*.ts`, `src/search.ts`,
-`src/integrations.ts` (implements `IntegrationDeps`), `src/workers/
-{webhooks,notifications,due_soon}.ts`.
+`src/db.ts` (opens the database with `openDb(DATABASE_URL)` from `@pm/db`;
+`withTxn(fn)` = `sql.begin(fn)`, i.e. `BEGIN IMMEDIATE`), `src/auth.ts`
+(cookie + bearer → `Actor`), `src/mutations/apply.ts` (`applyMutation(tx,
+actor, mutation, meta)` implementing the 8 steps of §3 "Mutations"),
+`src/mutations/<name>.ts` one per mutation, `src/activity.ts` (diff → rows),
+`src/notify.ts` (rules, collapsing, deliveries), `src/webhooks.ts` (enqueue +
+dispatcher loop), `src/sync/{push,pull,poke}.ts`, `src/routes/*.ts`,
+`src/search.ts`, `src/integrations.ts` (implements `IntegrationDeps`),
+`src/workers/{webhooks,notifications,due_soon}.ts`.
 
 Binding behaviours:
 
 * Error shape and codes exactly as §3; zod errors → 400 `validation` with
   `details.issues`; `PermissionError` → 403 `forbidden`; guard failures →
-  409 `guard_failed` with `details.failures`; Postgres `23514` → 400
-  `validation`; `23505` → 409 `conflict`; unknown key/uuid → 404 `not_found`.
+  409 `guard_failed` with `details.failures`; `sqliteErrorKind(e)` =
+  `'trigger'` (RAISE from a validation trigger), `'check'` or `'not_null'`
+  → 400 `validation` with the SQLite message; `'unique'` → 409 `conflict`;
+  `'busy'` → retry once, then 503; unknown key/uuid → 404 `not_found`.
+* Transactions are short and never span network I/O: workers claim due rows
+  in one `sql.begin` (`update … set status = 'sending' where id in (select …
+  limit N) returning *`), do the HTTP/SMTP call outside it, and record the
+  outcome in another. Read-only multi-statement work (pull, export) runs in
+  `sql.snapshot`.
 * Auth: `pm_session` cookie (httpOnly, signed with `APP_SECRET`; a row in
   `sessions`) or `Authorization: Bearer pm_<key>` (`sha256` lookup in
   `api_keys`, respects `revoked_at`/`expires_at`, updates `last_used_at`).
@@ -3091,8 +3318,8 @@ Binding behaviours:
   name starts with `agent:` or the request carries `X-PM-Actor-Kind: agent`
   — choose one and document it; `integration` for Slack/GitHub/email service
   actors).
-* `transitionItem`: `GuardContext` from SQL (`item_open_blockers`,
-  children categories, labels, `effective_project_role`), then
+* `transitionItem`: `GuardContext` from SQL (`open_blockers`, children
+  categories via `item_parents`, labels, the role from `effective_roles`), then
   `workflowEngine.evaluate`, patch, effects (`notify`, `webhook`,
   `add_label`, `remove_label`, `transition_parent_if`, `transition_children`
   — recursive, same `txn_id`).
@@ -3108,13 +3335,17 @@ Binding behaviours:
   item, txn); dispatcher loop every 5 s with the backoff schedule 1m → 5m →
   30m → 2h → 12h → `dead`; headers `X-PM-Event`, `X-PM-Delivery`,
   `X-PM-Signature: sha256=<hmac>`; body as §3.
-* Sync: push/pull/poke exactly as §3 "Sync protocol". KV keys via
+* Sync: push/pull/poke exactly as §3 "Sync protocol": push per mutation in
+  `sql.begin` with `version = sql.nextVersion()`; pull inside `sql.snapshot`
+  with `cookie = sync_state.version` read in that snapshot. KV keys via
   `rowKey()`. Visibility per table as listed. `resync_required` set on
   membership change, project visibility change, item `confidential` change,
   `moveItem`.
-* Search: `websearch_to_tsquery('english', q)` + `ts_rank` + `ts_headline`
-  snippet; trigram fallback `title % q` ordered by `similarity`; visibility
-  applied.
+* Search: `work_items_fts match ?` (sanitise the user's words into FTS5
+  syntax; quote tokens that contain punctuation) ranked by
+  `bm25(work_items_fts, 10.0, 5.0, 1.0)` with a `snippet()` excerpt; when it
+  returns nothing, fall back to `w.key like ? or w.title like ?` ordered by
+  `updated_at desc`; visibility applied in both.
 * `GET /api/v1/items`: query params build a `QuerySpec`; `cursor` is opaque
   base64 of `(sort value, id)`; `assignee=me` → `$me`.
 * `GET /api/v1/export/items.csv`: streaming CSV of `work_items_v` columns plus
@@ -3125,8 +3356,8 @@ Binding behaviours:
 * CORS: `APP_URL` only, credentials true. Rate limit: 600/min per credential,
   60/min on `/auth/*`.
 
-**Tests (`test/*.test.ts`, vitest, real Postgres in a temporary database,
-`buildApp()` + `app.inject`):**
+**Tests (`test/*.test.ts`, vitest, a temporary SQLite file or `:memory:`
+per suite with the migration applied, `buildApp()` + `app.inject`):**
 
 1. `GET /health` → 200 `{ok:true}`.
 2. Dev login → cookie → `GET /me` returns user, memberships, preferences; first
@@ -3147,7 +3378,7 @@ Binding behaviours:
    `state_id` and `start_date` with one `txn_id`; `complete` on a parent with
    open children → 409; `transition_children` / `transition_parent_if`
    effects on a custom workflow created via `PUT /workflows/:key`.
-7. Activity: one row per changed field for a 3-field patch; JSONB keys as
+7. Activity: one row per changed field for a 3-field patch; JSON keys as
    `fields.<key>`; `GET /items/:key/activity` paginates with `before`;
    `GET /activity?project=&since=` respects visibility.
 8. Bulk: `POST /items/bulk` on 3 keys → one `txn_id`; `bulk-transition` →
@@ -3183,8 +3414,8 @@ Binding behaviours:
     project (404); viewer cannot patch (403); editor cannot change members
     (403); firm admin can; `export` for viewer OK; confidential item hidden
     from `GET /items`, `/search`, `/export`.
-16. Search: FTS hit with rank and snippet; typo in title hits via trigram
-    fallback; project filter; visibility.
+16. Search: FTS5 hit with rank and snippet; a partial word (`curv`) hits
+    via the LIKE fallback; project filter; visibility.
 17. Views: CRUD, `run` for list (items) and dashboard (`widgets[].rows`),
     shared view visible to project members only.
 18. Types/workflows admin: `PUT /types/:key` with bad `field_defs` → 400;
@@ -3338,9 +3569,10 @@ keyboard `j/k/x` selection, filter builder round-trips a `FilterExpr`.
 
 `docs/01-data-model.md` (standalone data model walkthrough), `docs/02-design.md`
 (query layer, mutations, sync, notifications, webhooks), `docs/03-ux.md`,
-`docs/04-integrations.md`, `docs/05-operations.md`, `docs/adr/ADR-001..008.md`
+`docs/04-integrations.md`, `docs/05-operations.md`, `docs/adr/ADR-001..009.md`
 (generic item; workflows as data; edge table; append-only log; per-project
-roles; views as saved queries; global-version sync; monolith). Keep them
+roles; views as saved queries; global-version sync; monolith; SQLite over
+Postgres). Keep them
 consistent with `ARCHITECTURE.md` and the SQL; where you had to decide
 something, record it.
 
@@ -3421,7 +3653,7 @@ and one `transition` row per item not in its initial state, so history is
 non-empty.
 
 **Webhook endpoint**: `local-echo` → `http://localhost:9999/hook`,
-`event_kinds {*}`, `is_active = false`, secret `whsec_seed_do_not_use`.
+`event_kinds ["*"]` (JSON array), `is_active = 0`, secret `whsec_seed_do_not_use`.
 
 **Integration configs**: `slack` `{"team_id":"T0SEED","channel_map":{"RATES":"C0RATES","OPS":"C0OPS"}}` inactive;
 `github` `{"repos":["firm/curves"],"autolink":true}` inactive; `email`
@@ -3447,16 +3679,17 @@ pnpm --filter @pm/core build
 pnpm -r build
 pnpm typecheck
 
-# 2. database
+# 2. database (a file; nothing to start)
 cp .env.example .env
-podman compose up -d postgres
-pnpm db:migrate         # applies 0001_init.sql; second run prints "nothing to apply"
+pnpm db:migrate         # creates ./data/pmtool.db and applies 0001_init.sql; second run reports it as already applied
 pnpm db:seed            # idempotent
-psql "$DATABASE_URL" -c "select count(*) from work_items"                      # ≥ 40
-psql "$DATABASE_URL" -c "update activity_events set source='x' where id=1"    # ERROR 42501 append-only
+sqlite3 data/pmtool.db "select count(*) from work_items"                        # ≥ 40
+sqlite3 data/pmtool.db "update activity_events set source='x' where id=1"      # Runtime error: activity_events is append-only (UPDATE denied)
+# without the sqlite3 shell:
+node -e "const {DatabaseSync}=require('node:sqlite');console.log(new DatabaseSync('data/pmtool.db').prepare('select count(*) n from work_items').get())"
 
 # 3. tests
-pnpm test               # all packages green (parity + API tests need DATABASE_URL)
+pnpm test               # all packages green; every suite uses an in-memory or temporary SQLite database
 
 # 4. API
 pnpm dev:api &          # :3001
@@ -3497,8 +3730,8 @@ EOF
       are byte-identical to this document.
 * [ ] `pnpm install && pnpm --filter @pm/core build && pnpm -r build &&
       pnpm typecheck` succeed on a clean clone.
-* [ ] `pnpm db:migrate && pnpm db:seed` succeed against a fresh Postgres 16
-      and are idempotent.
+* [ ] `pnpm db:migrate && pnpm db:seed` succeed on a fresh clone (they create
+      `./data/pmtool.db` themselves) and are idempotent.
 * [ ] `pnpm test` is green in every package, including the SQL ↔ local
       query parity suite, API push/pull tests, integration signature tests,
       MCP in-memory transport tests, and the web vitest suite.
