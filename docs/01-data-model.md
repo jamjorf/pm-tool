@@ -944,7 +944,7 @@ Tracked columns (from `@pm/core` `TRACKED_ITEM_FIELDS`): `title`,
   gap is DDL (`drop table`, `alter table`) and the file itself: whoever can
   write the file can alter history. Close that gap at the operating-system
   level (the API's service account is the only writer; backups are immutable
-  copies; see [05-operations.md §2.5](05-operations.md#25-the-activity-log-as-the-audit-source)).
+  copies; see [05-operations.md §2.6](05-operations.md#26-the-activity-log-as-the-audit-source)).
   Role separation inside the database is one of the reasons to move to
   Postgres later ([ADR-009](adr/ADR-009-sqlite-over-postgres.md)).
 * **Soft deletes everywhere else** (`deleted_at`) mean a deleted item still
@@ -1199,18 +1199,31 @@ end;
 
 A regular FTS5 table (it stores its own copy of the three text columns) keyed
 by `id`. The `porter unicode61` tokenizer folds case and
-diacritics and stems English words (`pricers` matches `pricer`). Because the
-`assign_item_number` trigger fills `key` with an UPDATE after the insert, the
-`_au` trigger re-indexes the row immediately with its real key. Search and rank:
+diacritics and stems English words (`pricers` matches `pricer`). `id` is not
+unique inside the FTS table: SQLite fires AFTER INSERT triggers most recent
+first, so `assign_item_number` runs before `work_items_fts_ai`; its UPDATE
+indexes the row with its real key through `_au`, and `_ai` then adds a second
+entry for the same `id` with `key = ''`. Always resolve hits through the id
+(`w.id in (select id from work_items_fts where …)` for an unranked hit set,
+or the materialised CTE below when you need the rank); the extra entry
+disappears on the next update of key/title/description because `_au` deletes
+by id first. FTS5 auxiliary functions (`bm25`, `snippet`) may only appear in
+the query that holds the `MATCH`, not inside aggregates or window functions,
+hence the `materialized` CTE. Search and rank:
 
 ```sql
-select w.key, w.title,
-       bm25(work_items_fts, 10.0, 5.0, 1.0) as rank,          -- lower is better
-       snippet(work_items_fts, 3, '**', '**', '…', 18) as snippet
-  from work_items_fts
-  join work_items_v w on w.id = work_items_fts.id
- where work_items_fts match 'curve NOT legacy'
-   and w.deleted_at is null
+with hits as materialized (
+  select id,
+         bm25(work_items_fts, 10.0, 5.0, 1.0) as rank,                  -- lower is better
+         snippet(work_items_fts, 3, '**', '**', '…', 18) as snippet
+    from work_items_fts
+   where work_items_fts match 'curve NOT legacy'
+)
+select w.key, w.title, min(h.rank) as rank, h.snippet
+  from hits h
+  join work_items_v w on w.id = h.id
+ where w.deleted_at is null
+ group by w.id
  order by rank
  limit 20;
 ```
@@ -1365,7 +1378,7 @@ select w.key from open_blockers ob join work_items w on w.id = ob.blocker_id whe
 select role from effective_roles where user_id = '00000000-0000-4000-8000-000000000001' and project_id = '00000000-0000-4000-8000-000000000010';
 select count(*) from visible_items where user_id = '00000000-0000-4000-8000-000000000001';
 select key, name, guards, effects from workflow_transitions t join workflows w on w.id = t.workflow_id where w.key = 'standard' order by sort;
-select w.key, w.title, bm25(work_items_fts, 10.0, 5.0, 1.0) as rank from work_items_fts join work_items w on w.id = work_items_fts.id where work_items_fts match 'curve' order by rank;
+select key, title from work_items_v where id in (select id from work_items_fts where work_items_fts match 'curve');
 select version from sync_state;                                        -- the global sync version after all of the above
 ```
 

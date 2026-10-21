@@ -462,7 +462,7 @@ key's owner, who is the actor.
 * **One key per agent, named.** `actor_label` makes the audit trail
   attributable ("claude-triage" vs "alice-cli").
 * **Confidentiality holds.** The MCP server sees only what the key owner can
-  see (`can_view_item`); confidential items are invisible unless the owner is
+  see (the `visible_items` view); confidential items are invisible unless the owner is
   assignee/reporter/creator/admin. Do not give agents firm-admin keys.
 * **Prompt-injection surface.** Item titles, descriptions and comments are
   user-controlled text; the server never interprets them, but an agent will

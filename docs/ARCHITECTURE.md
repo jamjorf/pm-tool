@@ -85,9 +85,10 @@ required. The file and its directory are created on first open.
   `is_blocked` (0/1)). `fields.<key>` compiles to
   `json_extract(w.fields, '$.key')`; multi-valued kinds use `json_each`.
   `labels` compiles to an EXISTS over `work_item_labels`. `search` compiles
-  to `w.id in (select id from work_items_fts where work_items_fts match ?)`
-  ordered by `bm25(work_items_fts, 10.0, 5.0, 1.0)`; the search route falls
-  back to `LIKE` on key/title when FTS finds nothing. The permission scope is
+  to a join on `w.id` against the FTS hit set
+  `(select id, bm25(work_items_fts, 10.0, 5.0, 1.0) as rank from work_items_fts where work_items_fts match ?)`,
+  deduplicated by id and ordered by `rank`; the search route falls back to
+  `LIKE` on key/title when FTS finds nothing. The permission scope is
   added as an extra WHERE: `visibilityWhere(userId)` =
   `exists (select 1 from visible_items vi where vi.user_id = ? and vi.item_id = w.id)`.
   Widget time buckets (`day`/`week`/`month`) are computed in UTC with

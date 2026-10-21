@@ -102,9 +102,9 @@ Results are ranked: exact key match, then items in the current project, then rec
 |---|---|---|---|
 | Palette and view filter `contains` | local store | instant | key, title |
 | Filter bar `search` field (`match` op) | local first, server FTS when the view is saved or shared and the local scan finds few results | instant to about 50 ms | key, title, description |
-| Deep search (`/`, `/search`) | `GET /api/v1/search?q=&project=&limit=` | network | FTS over key, title, description with `websearch_to_tsquery`, ranked with snippets; trigram fallback on title for typos; visibility-filtered |
+| Deep search (`/`, `/search`) | `GET /api/v1/search?q=&project=&limit=` | network | FTS5 over key, title, description, ranked with `bm25` and snippets; `LIKE` fallback on key/title for partial words; visibility-filtered |
 
-Syntax follows Postgres `websearch_to_tsquery`: `"exact phrase"`, `-exclude`, `a or b`. Results show key, title, state chip, project and snippet. `fields` text is not in the tsvector; add a `fields.<key>` filter next to `search` when you need both.
+Syntax is SQLite FTS5: words are ANDed, `"exact phrase"`, `a OR b`, `NOT word`, `prefix*`. Results show key, title, state chip, project and snippet. `fields` text is not in the FTS index; add a `fields.<key>` filter next to `search` when you need both.
 
 ## Inbox and item detail shortcuts in context
 

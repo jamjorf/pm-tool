@@ -157,11 +157,13 @@ compileQuery(spec: QuerySpec, ctx: QueryContext, opts: CompileOptions): Compiled
   as text, `bool` as JSON `true`/`false`). Multi kinds (`has`, `has_any`,
   `has_all`) compile to `exists (select 1 from json_each(w.fields, '$.<key>') e where e.value …)`.
 * `labels` compiles to `EXISTS (select 1 from work_item_labels …)`.
-* `search` with `match` compiles to
-  `w.id in (select id from work_items_fts where work_items_fts match ?)` and,
-  when it is the first `search` leaf, orders by
-  `bm25(work_items_fts, 10.0, 5.0, 1.0)`. The `/api/v1/search` route adds a
-  `LIKE` fallback on `key`/`title` when FTS returns nothing (partial words).
+* `search` with `match` compiles to a join on `w.id` against the FTS hit set
+  `(select id, bm25(work_items_fts, 10.0, 5.0, 1.0) as rank from work_items_fts where work_items_fts match ?)`
+  and, when it is the first `search` leaf, orders by that `rank` (lower is
+  better). The hit set is deduplicated by `id` (see
+  [01-data-model.md §8.1](01-data-model.md#81-full-text-search-work_items_fts)).
+  The `/api/v1/search` route adds a `LIKE` fallback on `key`/`title` when FTS
+  returns nothing (partial words).
 * The permission scope is appended as an extra WHERE from
   `visibilityWhere(userId)`, which is exactly
   `exists (select 1 from visible_items vi where vi.user_id = ? and vi.item_id = w.id)`.

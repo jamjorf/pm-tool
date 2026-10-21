@@ -28,12 +28,10 @@ monorepo. Read this whole document before writing a file. Then:
    byte-for-byte the files you must create at the given paths. Do not
    "improve" them. Build the rest of the code against them.
 4. **Verify with tests, not by reading.** Every package has a `test` script
-   (vitest). Integration tests need Postgres: use `DATABASE_URL` (default
-   `postgres://postgres:postgres@localhost:5432/pmtool`) and start it with
-   `podman compose up -d postgres` if not running. If Podman is unavailable,
-   install Postgres locally; if neither is possible, keep going and mark the
-   DB-dependent tests as `skip` when `DATABASE_URL` is unreachable — but say
-   so in `PLAN.md`.
+   (vitest). The database is SQLite through Node's built-in `node:sqlite`
+   (Node 22.13+): `DATABASE_URL` is a file path (default `./data/pmtool.db`)
+   and tests open `:memory:` or a temporary file and apply the migration
+   themselves. Nothing has to be installed or started for any test.
 5. **Commit as you go.** `git init` at the start; one commit per phase with a
    message naming the phase and what passes. Never commit `.env`,
    `node_modules` or `dist`.
@@ -43,8 +41,10 @@ monorepo. Read this whole document before writing a file. Then:
 7. **Finish with the verification checklist (§9)** and make every line pass
    before declaring done (§10).
 
-Tooling assumptions: Node ≥ 22, pnpm 10 (`corepack enable && corepack prepare
-pnpm@10.28.0 --activate`), Podman 4.1+ with podman-compose (for Postgres 16), git.
+Tooling assumptions: Node ≥ 22.13 (for `node:sqlite`), pnpm 10 (`corepack
+enable && corepack prepare pnpm@10.28.0 --activate`), git. No database
+server, no container runtime, no native modules, no `sudo`. The `sqlite3`
+shell is optional (handy for the verification checklist).
 
 ---
 
@@ -58,9 +58,9 @@ views), not applications.
 ### 1.1 The data model (five non-negotiables)
 
 1. **One generic work item** with a `type` and typed columns plus validated
-   JSONB fields (`work_items.fields`, validated against
-   `item_types.field_defs` by a DB trigger and by `@pm/core`). No table per
-   type.
+   JSON fields (`work_items.fields`, JSON text validated against
+   `item_types.field_defs` by DB triggers using `json_each`/`json_type` and by
+   `@pm/core`). No table per type.
 2. **Workflows as an explicit, data-driven state machine per type**:
    `workflows` → `workflow_states` (with a closed `category`) →
    `workflow_transitions` with `guards[]` and `effects[]` as JSON, evaluated
@@ -68,18 +68,20 @@ views), not applications.
 3. **A typed relation edge table** (`relations` + `relation_types`
    registry): parent/child, blocks, duplicates, relates-to, links to external
    entities (GitHub PR, Slack thread, email, URL). Dependencies and rollups
-   are graph queries (`item_descendants`, `item_ancestors`,
-   `item_open_blockers`, `item_rollup`). Triggers enforce acyclicity and a
-   single parent.
+   are graph queries over the views `item_parents`, `item_ancestry`,
+   `open_blockers`, `item_rollups`. Triggers enforce acyclicity, reject the
+   reverse of a symmetric edge, and a partial unique index enforces a single
+   parent.
 4. **An append-only activity log, one event per field change**
-   (`activity_events`, UPDATE/DELETE/TRUNCATE physically blocked). It drives
-   history, audit, notifications, undo, webhooks and analytics.
+   (`activity_events`, UPDATE/DELETE physically blocked by triggers). It
+   drives history, audit, notifications, undo, webhooks and analytics.
 5. **Permissions decided up front: per-project roles** (`admin`/`editor`/
    `viewer`) plus firm role (`owner`/`admin`/`member`/`guest`), project
    visibility (`firm`/`private`) and a per-item `confidential` flag.
-   Attribute-style rules live in workflow guards. SQL functions
-   `effective_project_role()`, `can_view_item()`, `visible_project_ids()`
-   are the authority; `@pm/core` mirrors them.
+   Attribute-style rules live in workflow guards. The SQL views
+   `effective_roles(user_id, project_id, role)` and
+   `visible_items(user_id, item_id)` are the authority; `@pm/core` mirrors
+   them.
 
 ### 1.2 The tool
 
@@ -89,18 +91,19 @@ views), not applications.
   server (`compileQuery`) and in-memory on the client (`runSpec`), with
   parity tests.
 * **UX:** keyboard-first command palette (`⌘K`), instant navigation on
-  local data (Replicache, IndexedDB), bulk edit, good search (Postgres FTS +
-  trigram until it isn't), low-noise notifications (inbox, collapsing,
-  digests, quiet hours).
+  local data (Replicache, IndexedDB), bulk edit, good search (SQLite FTS5 +
+  bm25 ranking with a LIKE fallback, until it isn't), low-noise notifications
+  (inbox, collapsing, digests, quiet hours).
 * **Integrations:** webhooks out (HMAC-signed, retried), a clean REST API
   in (session cookie or API key), Slack (unfurls, autolink, `/pm` slash
   command, interactive buttons, DMs), email (inbound address scheme
   `pm+KEY-12@domain`, SMTP out), GitHub (PR/issue links, `Fixes KEY-12` on
   merge), and an **MCP server** so agents can read and act on tickets.
-* **Stack:** Postgres 16, TypeScript monorepo (pnpm, ESM, NodeNext), Fastify
-  5 API, React 18 + Vite + Replicache web app, zod 3, vitest. **Single
-  region, one API process, no microservices, no queue, no cache.** The hard
-  parts are the data model and the sync, not scale.
+* **Stack:** SQLite via Node's built-in `node:sqlite` (one file in WAL mode;
+  no server, no native module), TypeScript monorepo (pnpm, ESM, NodeNext),
+  Fastify 5 API, React 18 + Vite + Replicache web app, zod 3, vitest.
+  **Single region, one API process, one writer, no microservices, no queue,
+  no cache.** The hard parts are the data model and the sync, not scale.
 
 ### 1.3 Non-goals
 
@@ -122,13 +125,12 @@ pm-tool/
 ├── .npmrc
 ├── .gitignore
 ├── .env.example
-├── compose.yml
 ├── README.md
 ├── PLAN.md                      (yours)
 ├── docs/
 │   └── ARCHITECTURE.md          (§3, verbatim)
 └── packages/
-    ├── db/            @pm/db            migrations/0001_init.sql (§4), src/{migrate,seed,reset}.ts
+    ├── db/            @pm/db            migrations/0001_init.sql (§4), src/{sqlite,client,index,migrate,seed,reset}.ts
     ├── core/          @pm/core          src/{index,schema/entities,query/{spec,compile,evaluate},mutations,workflow/{types,engine},permissions/{types,evaluate},fields,events}.ts
     ├── api/           @pm/api           src/{server,app,db,auth,sync,mutations/*,routes/*,workers/*,integrations}.ts
     ├── integrations/  @pm/integrations  src/{index,deps,slack,github,email,render}.ts
@@ -139,8 +141,9 @@ pm-tool/
 Conventions (binding): ESM (`"type":"module"`), TypeScript `NodeNext`,
 imports inside a package use `.js` extensions, rows are **snake_case exactly
 as in SQL**, ids are UUIDs generated by the client (`crypto.randomUUID()`),
-validation with zod 3, tests with vitest, build order `@pm/core` first then
-`pnpm -r build`.
+booleans are 0/1 and JSON is text in SQL (the `@pm/db` runtime hydrates rows
+to `true`/`false` and parsed JSON by column name), validation with zod 3,
+tests with vitest, build order `@pm/core` first then `pnpm -r build`.
 
 ### 2.1 `package.json` (root)
 
@@ -178,19 +181,13 @@ validation with zod 3, tests with vitest, build order `@pm/core` first then
 <<<FILE:.env.example>>>
 ```
 
-### 2.7 `compose.yml` (dev, Podman)
-
-```yaml
-<<<FILE:compose.yml>>>
-```
-
-### 2.8 `README.md`
+### 2.7 `README.md`
 
 ````markdown
 <<<FILE:README.md>>>
 ````
 
-### 2.9 Per-package `package.json` files
+### 2.8 Per-package `package.json` files
 
 Use these as given (versions are known-good; you may bump patch versions if
 installation fails). Each package also gets a `tsconfig.json` extending
@@ -252,10 +249,14 @@ webhooks, notification rules, web app behaviour, integrations interface.
 
 ## 4. The database migration — `packages/db/migrations/0001_init.sql` (verbatim, complete)
 
-Create this file exactly. It is self-contained and applies to any Postgres
-15+ with `psql -f`. It defines every table, trigger, function, enum, index,
-the seeded `standard` and `simple` workflows, the `task`/`bug`/`initiative`/
-`request` item types, and the `work_items_v` view.
+Create this file exactly. It is self-contained and applies to any SQLite
+3.38+ with `sqlite3 pmtool.db < 0001_init.sql` (no extensions). It defines
+every table, trigger, view and index, the FTS5 table `work_items_fts`, the
+one-row `sync_state` counter and the per-table version triggers, the seeded
+`standard` and `simple` workflows and `task`/`bug`/`initiative`/`request`
+item types (fixed UUIDs), and the `work_items_v` view. Ids are UUID text,
+timestamps ISO-8601 UTC text, booleans 0/1, enums CHECK constraints, JSON
+columns text.
 
 ```sql
 <<<FILE:packages/db/migrations/0001_init.sql>>>
@@ -325,19 +326,30 @@ import type { FieldDef } from '../schema/entities.js';
 export interface CompileOptions {
   /** Base relation; default "work_items_v w" (has state_category, type_key, label ids etc.) */
   from?: string;
-  /** Field defs by item type key, to type JSONB fields (fields.<key>) correctly */
+  /** Field defs by item type key, to encode JSON fields (fields.<key>) correctly */
   fieldDefs?: Record<string, FieldDef[]>;
-  /** Extra WHERE fragments already parameterized, e.g. permission scope. */
+  /** Extra WHERE fragments already parameterized (`?` placeholders), e.g. permission scope. */
   extraWhere?: { text: string; values: unknown[] }[];
   select?: string; // default "w.*"
 }
-/** Compile a QuerySpec to parameterized SQL over work_items_v. */
+/** Compile a QuerySpec to parameterized SQLite SQL over work_items_v (`?` placeholders, values in order). */
 export function compileQuery(spec: QuerySpec, ctx: QueryContext, opts?: CompileOptions): CompiledQuery;
-/** Compile a dashboard widget into an aggregate query (group_by + measure). */
+/** Compile a dashboard widget into an aggregate query (group_by + measure; time buckets in UTC via strftime, weeks start Monday). */
 export function compileWidget(widget: Widget, ctx: QueryContext, opts?: CompileOptions): CompiledQuery;
-/** Build the permission-scope WHERE fragment for a user (mirrors can_view_item). */
-export function visibilityWhere(userId: string, paramOffset: number): { text: string; values: unknown[] };
+/** Permission-scope WHERE fragment: exists (select 1 from visible_items vi where vi.user_id = ? and vi.item_id = w.id). */
+export function visibilityWhere(userId: string): { text: string; values: unknown[] };
 ```
+
+SQL shapes the compiler must emit: `fields.<key>` → `json_extract(w.fields, '$.<key>')`
+(multi kinds via `json_each`); `labels` → `exists (select 1 from work_item_labels …)`;
+`search match` → a join on `w.id` against the FTS hit set
+`(select id, bm25(work_items_fts, 10.0, 5.0, 1.0) as rank from work_items_fts where work_items_fts match ?)`,
+deduplicated by `id` (the FTS table can hold two entries per item, see the
+migration's trigger order) and ordered by `rank`; `contains`/`starts_with` →
+`like` with escaped patterns; booleans bound as 0/1; `nin` keeps NULL rows.
+FTS5 auxiliary functions (`bm25`, `snippet`) are only legal in the query that
+holds the `MATCH`, so compute them in a `with hits as materialized (…)` CTE
+and aggregate outside it.
 
 `packages/core/src/query/evaluate.ts` (client-side evaluator):
 
@@ -416,13 +428,13 @@ export const EVENT_KINDS = [
   'project.created', 'project.updated',
 ] as const;
 export type EventKind = (typeof EVENT_KINDS)[number];
-/** Fields of work_items that are tracked one-event-per-field in the activity log (JSONB fields are tracked per key as "fields.<key>"). */
+/** Fields of work_items that are tracked one-event-per-field in the activity log (JSON fields are tracked per key as "fields.<key>"). */
 export const TRACKED_ITEM_FIELDS: (keyof WorkItem)[] = [
   'title', 'description', 'type_id', 'state_id', 'priority', 'assignee_id', 'reporter_id', 'start_date', 'due_date',
   'estimate', 'confidential', 'archived_at', 'project_id', 'sort_order',
 ];
 export type FieldChange = { field: string; old: unknown; new: unknown };
-/** Diff two item snapshots into one change per field (JSONB fields expanded to "fields.<key>"). */
+/** Diff two item snapshots into one change per field (JSON fields expanded to "fields.<key>"). */
 export function diffItem(before: Partial<WorkItem>, after: Partial<WorkItem>): FieldChange[];
 /** Map an activity event to the webhook event kind it represents (or null if internal). */
 export function eventKindOf(e: Pick<ActivityEvent, 'entity_type' | 'action' | 'field'>): EventKind | null;
@@ -472,56 +484,104 @@ Each phase ends with its tests green and a commit.
 
 ### Phase 1 — `@pm/db`
 
-Files: `migrations/0001_init.sql` (§4, verbatim), `src/migrate.ts`,
-`src/seed.ts`, `src/reset.ts`, `src/index.ts` (exports `migrate(databaseUrl)`,
-`seed(databaseUrl)`), `src/*.test.ts`.
+Files: `migrations/0001_init.sql` (§4, verbatim), `src/sqlite.ts` (the
+runtime layer), `src/client.ts`, `src/migrate.ts`, `src/seed.ts`,
+`src/reset.ts`, `src/index.ts` (re-exports everything below plus
+`connect()`, `databaseUrl()`, `databasePath()`), `src/*.test.ts`. The package
+depends on nothing but `node:sqlite` (and `tsx` to run scripts).
 
-* `migrate.ts`: creates `schema_migrations(filename text primary key, applied_at
-  timestamptz)` if missing, applies every `migrations/*.sql` not yet recorded
-  in filename order, each inside one transaction, using the `postgres` driver
-  (`sql.unsafe`/`sql.file`). Idempotent. Exits non-zero on error.
-* `reset.ts`: `drop schema public cascade; create schema public;` then migrate
-  and seed. Refuses when `NODE_ENV=production`.
-* `seed.ts`: implements §8 using plain SQL inserts (it may import nothing from
-  other packages). Idempotent: skips when `users` already has `alice@firm.com`.
+* `sqlite.ts`: `openDb(pathOrUrl?, opts?)` resolves the path
+  (`resolveDbPath`: `:memory:`, `sqlite:`/`file:` prefixes, absolute, or
+  relative to the repo root found via `pnpm-workspace.yaml`; default
+  `./data/pmtool.db`; creates the directory), opens a `DatabaseSync`, sets
+  `pragma busy_timeout = 5000`, `journal_mode = WAL` (file databases),
+  `foreign_keys = ON`, `synchronous = NORMAL`, registers SQL functions
+  `now()`, `uuid()`, `gen_random_uuid()`, `today()`, and returns a `Sql`:
+  a tagged template (`sql\`select … where id = ${id}\``) that compiles to
+  `?` placeholders, is thenable (returns hydrated rows) and has sync
+  accessors `.all()`, `.get()`, `.run()`; `sql(list)` → `(?, ?, ?)`
+  (empty → `(null)`); `sql.raw(text)`, `sql.unsafe(text, params)`,
+  `sql.json(v)`; nested fragments splice with their params. Params:
+  booleans → 0/1, objects/arrays → JSON text, `Date` → ISO, `undefined` →
+  null. Rows: `hydrateRow` parses `JSON_COLUMNS` (and `*_json` aliases) and
+  turns 0/1 in `BOOLEAN_COLUMNS` (and `is_*`) into booleans; export
+  `registerJsonColumns`/`registerBooleanColumns`. Transactions:
+  `sql.begin(fn)` = `BEGIN IMMEDIATE` behind an async mutex, statements in
+  the same async context (AsyncLocalStorage) join it, nested `begin` →
+  `SAVEPOINT`; `sql.snapshot(fn)` = `BEGIN DEFERRED`; `sql.savepoint(fn)`;
+  `sql.exec(text)` for multi-statement scripts; `sql.nextVersion()` /
+  `sql.currentVersion()` on `sync_state`; `sql.inTransaction`, `sql.path`,
+  `sql.db`, `sql.close()`. `sqliteErrorKind(e)` → `'unique' | 'check' |
+  'foreign_key' | 'not_null' | 'trigger' | 'busy' | 'other'` from the
+  extended errcode (2067, 275, 787, 1299, 1811, 5/6).
+* `migrate.ts`: `runMigrations(sql, { dir?, log? })` creates
+  `schema_migrations(name text primary key, applied_at text)` if missing;
+  inside one `sql.begin`, if no migration is recorded but `work_items`
+  exists, records the first file as **adopted** (schema applied out of band
+  with `sqlite3`); then applies every `migrations/*.sql` not yet recorded in
+  filename order with `tx.exec(text)` and records it. Returns
+  `{ applied, skipped, adopted }`. The CLI (`tsx src/migrate.ts`) prints the
+  database path and the summary; exits non-zero on error.
+* `reset.ts`: `reset(url?)` refuses unless `isLocalDatabaseUrl(url)` (a
+  plain file path or `:memory:`; never a URL) and the CLI was given `--yes`;
+  deletes the file and its `-wal`/`-shm` siblings, then migrates and seeds.
+* `seed.ts`: `seed(sql, { force?, now?, log? })` implements §8 through the
+  `sql` tag inside one `sql.begin` (it may import nothing from other
+  packages). Idempotent: returns `null` when any user exists unless `force`.
+  Remember `RETURNING` shows `number`/`key`/`version` before the triggers
+  run: read rows back when the seed needs keys.
 
-**Tests (`src/db.test.ts`, require `DATABASE_URL`; create a temporary database
-`pmtool_test_<random>` and drop it after):**
+**Tests (`src/*.test.ts`; each opens `openDb(':memory:')` or a file under
+`os.tmpdir()` and runs `runMigrations`):**
 
-1. Migration applies on an empty database without error; running `migrate`
-   twice is a no-op.
+1. Migration applies on an empty database without error; running
+   `runMigrations` twice is a no-op (`skipped` lists it); a database created
+   with `sql.exec(readFileSync('0001_init.sql'))` is **adopted** on the first
+   run.
 2. `insert into work_items` without `number` yields `number = 1`, `key =
-   'RATES-1'`; the second item gets `RATES-2`; `projects.item_seq` is 2.
-3. `trg_validate_item_fields`: unknown key rejected (`23514`); missing
-   required `severity` on a `bug` rejected; wrong type (`severity: 1`)
-   rejected; a valid bug inserts.
-4. `trg_validate_item_state`: a `task` with a `simple`-workflow state is
+   'RATES-1'` when read back; the second item gets `RATES-2`;
+   `projects.item_seq` is 2; `RETURNING` returned null for both.
+3. Field validation triggers: unknown key rejected (`sqliteErrorKind` =
+   `'trigger'`, message names the field); missing required `severity` on a
+   `bug` rejected; wrong type (`severity: 1`) rejected; a valid bug inserts.
+4. State validation triggers: a `task` with a `simple`-workflow state is
    rejected.
-5. Relations: self-edge rejected; duplicate (type, from, to) rejected; second
-   parent rejected (unique index); `blocks` cycle A→B→C→A rejected with the
-   cycle message; `parent_of` cycle rejected; `relates_to` cycle allowed;
-   external edge requires `external_kind` + `external_ref` and forbids
-   `to_item_id`; `external_key` is generated as `github_pr:<url>`.
-6. `item_descendants` / `item_ancestors` depths; `item_open_blockers` ignores
-   done/canceled blockers and deleted items; `item_rollup` counts and
-   estimate sums.
-7. `activity_events`: UPDATE, DELETE and TRUNCATE each raise `42501`.
-8. `effective_project_role` matrix: explicit member row wins over firm role;
-   firm owner/admin → admin everywhere; member on firm project → editor;
-   member on private project → null; guest without row → null; deleted
-   membership ignored. `can_view_item`: confidential visible to admin,
-   assignee, reporter, creator; not to another editor. `visible_project_ids`.
-9. `trg_set_version`: `version` strictly increases across inserts/updates on
-   two different tables; `updated_at` changes on update.
+5. Relations: self-edge rejected (`check`); duplicate (type, from, to)
+   rejected (`unique`); second parent rejected (unique index); `blocks`
+   cycle A→B→C→A rejected with `relation would create a cycle`;
+   `parent_of` cycle rejected; `relates_to` reverse duplicate rejected with
+   the symmetric message; external edge requires `external_kind` +
+   `external_ref` and forbids `to_item_id`; `external_key` is generated as
+   `github_pr:<url>`.
+6. Views: `item_ancestry` depths; `open_blockers` ignores done/canceled
+   blockers and deleted items; `item_rollups` counts and estimate sums.
+7. `activity_events`: UPDATE and DELETE each raise the append-only message.
+8. `effective_roles` matrix: explicit member row wins over firm role; firm
+   owner/admin → admin everywhere; member on firm project → editor; member
+   on private project → no row; guest without row → no row; deleted
+   membership ignored. `visible_items`: confidential visible to admin,
+   assignee, reporter, creator; not to another editor.
+9. Version triggers: `version` strictly increases across inserts/updates on
+   two different tables and equals `sync_state.version` after each;
+   `updated_at` changes on update.
 10. `work_items_v` exposes `type_key`, `state_category`, `project_key`,
-    `assignee_name`, `label_names`, `parent_id`, `is_blocked`.
-11. Seed: after `seed()`, counts match §8 and every seeded view's `spec`
-    parses with `ViewSpec` (import from `@pm/core` **in the test only**).
+    `assignee_name`, `label_names` (hydrated to an array), `parent_id`,
+    `is_blocked` (hydrated to a boolean).
+11. `work_items_fts`: a title word matches with `match`, ranking puts a key
+    hit first, an update re-indexes, a delete removes the row.
+12. Runtime: `sql(list)` renders `(?, ?)`; booleans bind as 0/1 and read
+    back as booleans; JSON columns round-trip; nested `begin` is a savepoint
+    that rolls back alone; two concurrent `begin` calls serialise;
+    `snapshot` sees a consistent state while a `begin` is pending.
+13. Seed: after `seed()`, counts match §8 and every seeded view's `spec`
+    parses with `ViewSpec` (import from `@pm/core` **in the test only**);
+    `seed()` again returns `null`; `seed(sql, { force: true })` reseeds.
 
 ### Phase 2 — `@pm/core`
 
 Files per §5. Pure: no Node-only imports, no I/O (the parity test is the only
-file that touches Postgres and it lives in `src/query/parity.test.ts`).
+file that touches a database, an in-memory SQLite opened through `@pm/db`
+as a dev dependency, and it lives in `src/query/parity.test.ts`).
 
 **Tests:**
 
@@ -547,23 +607,24 @@ file that touches Postgres and it lives in `src/query/parity.test.ts`).
   each role; confidential rule; `*_own`; `firm_admin`; inactive user; `assert`
   throws `PermissionError` with `status 403`).
 * `query/compile.test.ts`: for every `FilterOp` on a representative field the
-  SQL text contains the expected fragment and `values` are positional
-  (`$1..$n`), no string interpolation of values; `fields.<key>` casts by
-  kind; `labels has` → `EXISTS`; `search match` → `websearch_to_tsquery`;
-  macros resolved; `sort` with `nulls`; `group_by` → `isAggregate`;
-  `extraWhere` appended; `limit/offset`; `include_archived`; `compileWidget`
-  for each `Measure`/`time_bucket`.
+  SQL text contains the expected fragment and `values` are positional `?`
+  placeholders in order, no string interpolation of values; `fields.<key>`
+  → `json_extract` (multi kinds → `json_each`); `labels has` → `EXISTS`;
+  `search match` → `work_items_fts match` with `bm25` ordering; macros
+  resolved; `sort` with `nulls`; `group_by` → `isAggregate`; `extraWhere`
+  appended (`visibilityWhere` → `exists (select 1 from visible_items …)`);
+  `limit/offset`; `include_archived`; `compileWidget` for each
+  `Measure`/`time_bucket` (UTC `strftime`, weeks start Monday).
 * `query/evaluate.test.ts`: every op against in-memory rows, dotted refs via
   lookups, macros with injected `now` and `tz`, sort stability and nulls,
   grouping labels (state name, assignee id, field option label).
-* `query/parity.test.ts` (**SQL ↔ local parity**, skips when `DATABASE_URL`
-  is unreachable): load a fixture of ≥ 30 items across 2 projects, 3 types,
-  labels, parent/blocks relations and varied dates/fields into a temporary
-  database (apply §4 first); define ≥ 40 specs covering every op, dotted
-  refs, macros, `and/or/not` nesting, sorts with nulls and `group_by`;
-  for each spec assert `compileQuery` executed against Postgres and
-  `runSpec` over the same rows return **identical ordered id lists** and
-  identical group keys.
+* `query/parity.test.ts` (**SQL ↔ local parity**): load a fixture of ≥ 30
+  items across 2 projects, 3 types, labels, parent/blocks relations and
+  varied dates/fields into `openDb(':memory:')` with §4 applied; define ≥ 40
+  specs covering every op, dotted refs, macros, `and/or/not` nesting, sorts
+  with nulls and `group_by`; for each spec assert `compileQuery` executed
+  against SQLite and `runSpec` over the same (hydrated) rows return
+  **identical ordered id lists** and identical group keys.
 * `events.test.ts`: `diffItem` yields one change per changed tracked field
   and `fields.<key>` entries, ignores unchanged and absent fields, treats
   `undefined` and `null` as equal; `eventKindOf` maps `work_item/create` →
@@ -583,22 +644,29 @@ protocol, auth, the mutation pipeline, workers and search.
 
 Structure (suggested): `src/server.ts` (boot), `src/app.ts` (`buildApp(opts)`
 returns a Fastify instance without listening — tests use `app.inject`),
-`src/db.ts` (`postgres` client, `withTxn(fn)` that runs `select
-pg_advisory_xact_lock(42)` first), `src/auth.ts` (cookie + bearer →
-`Actor`), `src/mutations/apply.ts` (`applyMutation(tx, actor, mutation,
-meta)` implementing the 8 steps of §3 "Mutations"), `src/mutations/<name>.ts`
-one per mutation, `src/activity.ts` (diff → rows), `src/notify.ts`
-(rules, collapsing, deliveries), `src/webhooks.ts` (enqueue + dispatcher
-loop), `src/sync/{push,pull,poke}.ts`, `src/routes/*.ts`, `src/search.ts`,
-`src/integrations.ts` (implements `IntegrationDeps`), `src/workers/
-{webhooks,notifications,due_soon}.ts`.
+`src/db.ts` (opens the database with `openDb(DATABASE_URL)` from `@pm/db`;
+`withTxn(fn)` = `sql.begin(fn)`, i.e. `BEGIN IMMEDIATE`), `src/auth.ts`
+(cookie + bearer → `Actor`), `src/mutations/apply.ts` (`applyMutation(tx,
+actor, mutation, meta)` implementing the 8 steps of §3 "Mutations"),
+`src/mutations/<name>.ts` one per mutation, `src/activity.ts` (diff → rows),
+`src/notify.ts` (rules, collapsing, deliveries), `src/webhooks.ts` (enqueue +
+dispatcher loop), `src/sync/{push,pull,poke}.ts`, `src/routes/*.ts`,
+`src/search.ts`, `src/integrations.ts` (implements `IntegrationDeps`),
+`src/workers/{webhooks,notifications,due_soon}.ts`.
 
 Binding behaviours:
 
 * Error shape and codes exactly as §3; zod errors → 400 `validation` with
   `details.issues`; `PermissionError` → 403 `forbidden`; guard failures →
-  409 `guard_failed` with `details.failures`; Postgres `23514` → 400
-  `validation`; `23505` → 409 `conflict`; unknown key/uuid → 404 `not_found`.
+  409 `guard_failed` with `details.failures`; `sqliteErrorKind(e)` =
+  `'trigger'` (RAISE from a validation trigger), `'check'` or `'not_null'`
+  → 400 `validation` with the SQLite message; `'unique'` → 409 `conflict`;
+  `'busy'` → retry once, then 503; unknown key/uuid → 404 `not_found`.
+* Transactions are short and never span network I/O: workers claim due rows
+  in one `sql.begin` (`update … set status = 'sending' where id in (select …
+  limit N) returning *`), do the HTTP/SMTP call outside it, and record the
+  outcome in another. Read-only multi-statement work (pull, export) runs in
+  `sql.snapshot`.
 * Auth: `pm_session` cookie (httpOnly, signed with `APP_SECRET`; a row in
   `sessions`) or `Authorization: Bearer pm_<key>` (`sha256` lookup in
   `api_keys`, respects `revoked_at`/`expires_at`, updates `last_used_at`).
@@ -611,8 +679,8 @@ Binding behaviours:
   name starts with `agent:` or the request carries `X-PM-Actor-Kind: agent`
   — choose one and document it; `integration` for Slack/GitHub/email service
   actors).
-* `transitionItem`: `GuardContext` from SQL (`item_open_blockers`,
-  children categories, labels, `effective_project_role`), then
+* `transitionItem`: `GuardContext` from SQL (`open_blockers`, children
+  categories via `item_parents`, labels, the role from `effective_roles`), then
   `workflowEngine.evaluate`, patch, effects (`notify`, `webhook`,
   `add_label`, `remove_label`, `transition_parent_if`, `transition_children`
   — recursive, same `txn_id`).
@@ -628,13 +696,17 @@ Binding behaviours:
   item, txn); dispatcher loop every 5 s with the backoff schedule 1m → 5m →
   30m → 2h → 12h → `dead`; headers `X-PM-Event`, `X-PM-Delivery`,
   `X-PM-Signature: sha256=<hmac>`; body as §3.
-* Sync: push/pull/poke exactly as §3 "Sync protocol". KV keys via
+* Sync: push/pull/poke exactly as §3 "Sync protocol": push per mutation in
+  `sql.begin` with `version = sql.nextVersion()`; pull inside `sql.snapshot`
+  with `cookie = sync_state.version` read in that snapshot. KV keys via
   `rowKey()`. Visibility per table as listed. `resync_required` set on
   membership change, project visibility change, item `confidential` change,
   `moveItem`.
-* Search: `websearch_to_tsquery('english', q)` + `ts_rank` + `ts_headline`
-  snippet; trigram fallback `title % q` ordered by `similarity`; visibility
-  applied.
+* Search: `work_items_fts match ?` (sanitise the user's words into FTS5
+  syntax; quote tokens that contain punctuation) ranked by
+  `bm25(work_items_fts, 10.0, 5.0, 1.0)` with a `snippet()` excerpt; when it
+  returns nothing, fall back to `w.key like ? or w.title like ?` ordered by
+  `updated_at desc`; visibility applied in both.
 * `GET /api/v1/items`: query params build a `QuerySpec`; `cursor` is opaque
   base64 of `(sort value, id)`; `assignee=me` → `$me`.
 * `GET /api/v1/export/items.csv`: streaming CSV of `work_items_v` columns plus
@@ -645,8 +717,8 @@ Binding behaviours:
 * CORS: `APP_URL` only, credentials true. Rate limit: 600/min per credential,
   60/min on `/auth/*`.
 
-**Tests (`test/*.test.ts`, vitest, real Postgres in a temporary database,
-`buildApp()` + `app.inject`):**
+**Tests (`test/*.test.ts`, vitest, a temporary SQLite file or `:memory:`
+per suite with the migration applied, `buildApp()` + `app.inject`):**
 
 1. `GET /health` → 200 `{ok:true}`.
 2. Dev login → cookie → `GET /me` returns user, memberships, preferences; first
@@ -667,7 +739,7 @@ Binding behaviours:
    `state_id` and `start_date` with one `txn_id`; `complete` on a parent with
    open children → 409; `transition_children` / `transition_parent_if`
    effects on a custom workflow created via `PUT /workflows/:key`.
-7. Activity: one row per changed field for a 3-field patch; JSONB keys as
+7. Activity: one row per changed field for a 3-field patch; JSON keys as
    `fields.<key>`; `GET /items/:key/activity` paginates with `before`;
    `GET /activity?project=&since=` respects visibility.
 8. Bulk: `POST /items/bulk` on 3 keys → one `txn_id`; `bulk-transition` →
@@ -703,8 +775,8 @@ Binding behaviours:
     project (404); viewer cannot patch (403); editor cannot change members
     (403); firm admin can; `export` for viewer OK; confidential item hidden
     from `GET /items`, `/search`, `/export`.
-16. Search: FTS hit with rank and snippet; typo in title hits via trigram
-    fallback; project filter; visibility.
+16. Search: FTS5 hit with rank and snippet; a partial word (`curv`) hits
+    via the LIKE fallback; project filter; visibility.
 17. Views: CRUD, `run` for list (items) and dashboard (`widgets[].rows`),
     shared view visible to project members only.
 18. Types/workflows admin: `PUT /types/:key` with bad `field_defs` → 400;
@@ -858,9 +930,10 @@ keyboard `j/k/x` selection, filter builder round-trips a `FilterExpr`.
 
 `docs/01-data-model.md` (standalone data model walkthrough), `docs/02-design.md`
 (query layer, mutations, sync, notifications, webhooks), `docs/03-ux.md`,
-`docs/04-integrations.md`, `docs/05-operations.md`, `docs/adr/ADR-001..008.md`
+`docs/04-integrations.md`, `docs/05-operations.md`, `docs/adr/ADR-001..009.md`
 (generic item; workflows as data; edge table; append-only log; per-project
-roles; views as saved queries; global-version sync; monolith). Keep them
+roles; views as saved queries; global-version sync; monolith; SQLite over
+Postgres). Keep them
 consistent with `ARCHITECTURE.md` and the SQL; where you had to decide
 something, record it.
 
@@ -941,7 +1014,7 @@ and one `transition` row per item not in its initial state, so history is
 non-empty.
 
 **Webhook endpoint**: `local-echo` → `http://localhost:9999/hook`,
-`event_kinds {*}`, `is_active = false`, secret `whsec_seed_do_not_use`.
+`event_kinds ["*"]` (JSON array), `is_active = 0`, secret `whsec_seed_do_not_use`.
 
 **Integration configs**: `slack` `{"team_id":"T0SEED","channel_map":{"RATES":"C0RATES","OPS":"C0OPS"}}` inactive;
 `github` `{"repos":["firm/curves"],"autolink":true}` inactive; `email`
@@ -967,16 +1040,17 @@ pnpm --filter @pm/core build
 pnpm -r build
 pnpm typecheck
 
-# 2. database
+# 2. database (a file; nothing to start)
 cp .env.example .env
-podman compose up -d postgres
-pnpm db:migrate         # applies 0001_init.sql; second run prints "nothing to apply"
+pnpm db:migrate         # creates ./data/pmtool.db and applies 0001_init.sql; second run reports it as already applied
 pnpm db:seed            # idempotent
-psql "$DATABASE_URL" -c "select count(*) from work_items"                      # ≥ 40
-psql "$DATABASE_URL" -c "update activity_events set source='x' where id=1"    # ERROR 42501 append-only
+sqlite3 data/pmtool.db "select count(*) from work_items"                        # ≥ 40
+sqlite3 data/pmtool.db "update activity_events set source='x' where id=1"      # Runtime error: activity_events is append-only (UPDATE denied)
+# without the sqlite3 shell:
+node -e "const {DatabaseSync}=require('node:sqlite');console.log(new DatabaseSync('data/pmtool.db').prepare('select count(*) n from work_items').get())"
 
 # 3. tests
-pnpm test               # all packages green (parity + API tests need DATABASE_URL)
+pnpm test               # all packages green; every suite uses an in-memory or temporary SQLite database
 
 # 4. API
 pnpm dev:api &          # :3001
@@ -1017,8 +1091,8 @@ EOF
       are byte-identical to this document.
 * [ ] `pnpm install && pnpm --filter @pm/core build && pnpm -r build &&
       pnpm typecheck` succeed on a clean clone.
-* [ ] `pnpm db:migrate && pnpm db:seed` succeed against a fresh Postgres 16
-      and are idempotent.
+* [ ] `pnpm db:migrate && pnpm db:seed` succeed on a fresh clone (they create
+      `./data/pmtool.db` themselves) and are idempotent.
 * [ ] `pnpm test` is green in every package, including the SQL ↔ local
       query parity suite, API push/pull tests, integration signature tests,
       MCP in-memory transport tests, and the web vitest suite.

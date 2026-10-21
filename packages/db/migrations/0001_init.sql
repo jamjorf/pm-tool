@@ -293,8 +293,13 @@ create virtual table work_items_fts using fts5(
   tokenize = 'porter unicode61'
 );
 
+-- AFTER INSERT triggers fire most-recently-created first, so assign_item_number
+-- (below) may already have re-indexed this row through work_items_fts_au;
+-- delete first so an item never has two FTS rows.
 create trigger work_items_fts_ai after insert on work_items begin
-  insert into work_items_fts(id, key, title, description) values (new.id, coalesce(new.key,''), new.title, new.description);
+  delete from work_items_fts where id = new.id;
+  insert into work_items_fts(id, key, title, description)
+    select id, coalesce(key, ''), title, description from work_items where id = new.id;
 end;
 create trigger work_items_fts_au after update of key, title, description on work_items begin
   delete from work_items_fts where id = old.id;

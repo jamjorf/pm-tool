@@ -12,7 +12,7 @@ Source and README: [`packages/mcp/README.md`](https://github.com/jamjorf/pm-tool
 |---|---|---|
 | `list_projects` | `include_archived?` | projects visible to the key: key, name, status, visibility |
 | `get_project` | `key` | members, item counts by state category, saved views, default type |
-| `search_items` | `q, project?, limit?` | full-text search (`GET /api/v1/search`), websearch syntax, fuzzy title fallback |
+| `search_items` | `q, project?, limit?` | full-text search (`GET /api/v1/search`), FTS5 syntax (`"phrase"`, `OR`, `NOT`, `prefix*`), `LIKE` fallback on key/title for partial words |
 | `query_items` | `spec, project?` | structured `QuerySpec` (`POST /api/v1/items/query`); the description documents fields, ops and macros |
 | `get_item` | `key` | item, fields, labels, parent and children, relations incl. external links, rollup, watchers, available transitions with guard results |
 | `create_item` | `project, type?, title, description?, priority?, assignee?, due_date?, start_date?, estimate?, labels?, parent?, fields?, confidential?` | `assignee` accepts an email, user id or exact name; `type` is a type key (defaults to the project default); labels and parent applied after creation |
@@ -125,7 +125,7 @@ Every write the agent performs is a normal mutation: guards apply, the activity 
 
 - **Scopes.** Create agent keys with `scopes: ["read"]` when the agent only reports; add `write` only for agents expected to change things. Keys can carry `expires_at` and are revocable with `DELETE /me/api-keys/:id`.
 - **One key per agent, named.** `actor_label` makes the audit trail attributable ("claude-triage" vs "alice-cli").
-- **Confidentiality holds.** The MCP server sees only what the key owner can see (`can_view_item`); confidential items are invisible unless the owner is assignee, reporter, creator or project admin. Do not give agents firm-admin keys.
+- **Confidentiality holds.** The MCP server sees only what the key owner can see (the `visible_items` view); confidential items are invisible unless the owner is assignee, reporter, creator or project admin. Do not give agents firm-admin keys.
 - **Prompt-injection surface.** Item titles, descriptions and comments are user-controlled text; the server never interprets them, but an agent will read them. Treat tool output as data in agent instructions.
 - **No bypass.** The MCP server has no database credentials; it cannot read `activity_events` beyond what `/api/v1/activity` exposes under visibility rules.
 - **Rate limits** apply per key like any client ([docs/05-operations.md §3](https://github.com/jamjorf/pm-tool/blob/main/docs/05-operations.md#3-security)).

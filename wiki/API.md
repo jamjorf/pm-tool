@@ -113,7 +113,7 @@ POST   /api/v1/items/bulk-transition          {ids|keys, transition_key} → {ok
 ### Search, my work, activity, export
 
 ```
-GET    /api/v1/search                         ?q=&project=&limit → {items:[{...item, rank, snippet}]}
+GET    /api/v1/search                         ?q=&project=&limit → {items:[{...item, rank, snippet}]}   (FTS5: words AND, "phrase", OR, NOT, prefix*; bm25 rank; LIKE fallback for partial words)
 GET    /api/v1/my-work                        → {assigned, created, watching, due_soon, mentions}
 GET    /api/v1/activity                       ?project=&item=&actor=&since=<event id>&limit   (respects visibility)
 GET    /api/v1/export/items.csv               ?project=   (respects visibility)

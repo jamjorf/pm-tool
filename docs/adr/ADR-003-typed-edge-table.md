@@ -23,9 +23,10 @@ linking.
 Invariants in the database: a check constraint for the internal/external
 shape, no self-edges, unique (type, from, to), a partial unique index giving
 every item at most one parent, and a trigger that refuses cycles in any
-hierarchy or blocking type. Graph queries are SQL functions:
-`item_descendants`, `item_ancestors`, `item_open_blockers`, `item_rollup`;
-the `work_items_v` view exposes `parent_id` and `is_blocked`.
+hierarchy or blocking type (and refuses the reverse of a symmetric edge).
+Graph queries are views (SQLite has no SQL functions): `item_parents`,
+`item_ancestry`, `open_blockers`, `item_rollups`; the `work_items_v` view
+exposes `parent_id` and `is_blocked`.
 
 ## Consequences
 
