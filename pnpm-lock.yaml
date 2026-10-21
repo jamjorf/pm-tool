@@ -80,9 +80,6 @@ importers:
 
   packages/db:
     dependencies:
-      postgres:
-        specifier: ^3.4.5
-        version: 3.4.9
       tsx:
         specifier: ^4.19.2
         version: 4.23.15
