@@ -25,12 +25,12 @@ Documentation lives in `docs/`: start with [`docs/README.md`](docs/README.md). T
 
 Full guide with a five-minute tour: [Quick Start](https://github.com/jamjorf/pm-tool/wiki/Quick-Start) in the wiki.
 
-**Prerequisites:** Node 22, pnpm 10 (`corepack enable` is enough), and Docker, or any Postgres 15+ you can point `DATABASE_URL` at.
+**Prerequisites:** Node 22, pnpm 10 (`corepack enable` is enough), and Podman 4.1+ with a compose provider (`podman-compose`), or any Postgres 15+ you can point `DATABASE_URL` at.
 
 ```bash
 git clone https://github.com/jamjorf/pm-tool && cd pm-tool
 cp .env.example .env                 # defaults work for local use
-docker compose up -d postgres        # skip if you set DATABASE_URL to your own Postgres
+podman compose up -d postgres        # skip if you set DATABASE_URL to your own Postgres
 pnpm install
 pnpm --filter @pm/core build         # other packages import @pm/core from its dist
 pnpm db:migrate && pnpm db:seed      # schema + realistic demo data

@@ -10,7 +10,7 @@ for (const f of [resolve(process.cwd(), '.env'), resolve(process.cwd(), '../../.
   if (existsSync(f)) { try { process.loadEnvFile(f); } catch { /* ignore */ } break; }
 }
 
-/** DATABASE_URL from the environment, else the local docker-compose default. */
+/** DATABASE_URL from the environment, else the default from compose.yml (podman compose up -d postgres). */
 export function databaseUrl(): string {
   return process.env.DATABASE_URL || DEFAULT_DATABASE_URL;
 }

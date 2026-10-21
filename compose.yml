@@ -1,6 +1,9 @@
+# Local Postgres for development. Written for Podman:
+#   podman compose up -d postgres        (Podman 4.1+; needs podman-compose or docker-compose installed as the provider)
+# The file follows the Compose specification, so `docker compose` reads it unchanged.
 services:
   postgres:
-    image: postgres:16
+    image: docker.io/library/postgres:16   # fully qualified so Podman never asks which registry to use
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres

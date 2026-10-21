@@ -30,7 +30,7 @@ monorepo. Read this whole document before writing a file. Then:
 4. **Verify with tests, not by reading.** Every package has a `test` script
    (vitest). Integration tests need Postgres: use `DATABASE_URL` (default
    `postgres://postgres:postgres@localhost:5432/pmtool`) and start it with
-   `docker compose up -d postgres` if not running. If Docker is unavailable,
+   `podman compose up -d postgres` if not running. If Podman is unavailable,
    install Postgres locally; if neither is possible, keep going and mark the
    DB-dependent tests as `skip` when `DATABASE_URL` is unreachable — but say
    so in `PLAN.md`.
@@ -44,7 +44,7 @@ monorepo. Read this whole document before writing a file. Then:
    before declaring done (§10).
 
 Tooling assumptions: Node ≥ 22, pnpm 10 (`corepack enable && corepack prepare
-pnpm@10.28.0 --activate`), Docker (for Postgres 16), git.
+pnpm@10.28.0 --activate`), Podman 4.1+ with podman-compose (for Postgres 16), git.
 
 ---
 
@@ -122,7 +122,7 @@ pm-tool/
 ├── .npmrc
 ├── .gitignore
 ├── .env.example
-├── docker-compose.yml
+├── compose.yml
 ├── README.md
 ├── PLAN.md                      (yours)
 ├── docs/
@@ -178,10 +178,10 @@ validation with zod 3, tests with vitest, build order `@pm/core` first then
 <<<FILE:.env.example>>>
 ```
 
-### 2.7 `docker-compose.yml` (dev)
+### 2.7 `compose.yml` (dev, Podman)
 
 ```yaml
-<<<FILE:docker-compose.yml>>>
+<<<FILE:compose.yml>>>
 ```
 
 ### 2.8 `README.md`
@@ -969,7 +969,7 @@ pnpm typecheck
 
 # 2. database
 cp .env.example .env
-docker compose up -d postgres
+podman compose up -d postgres
 pnpm db:migrate         # applies 0001_init.sql; second run prints "nothing to apply"
 pnpm db:seed            # idempotent
 psql "$DATABASE_URL" -c "select count(*) from work_items"                      # ≥ 40

@@ -30,10 +30,17 @@ Internet ──TLS──▶ reverse proxy ──▶ /            static web buil
 
 ### 2.2 Production compose example
 
+The firm runs containers with Podman. The file below follows the Compose
+specification and is started with `podman compose up -d` (Podman 4.1+ with
+`podman-compose` as the provider); rootless Podman is fine for the API, and
+`podman generate systemd` or Quadlet units turn the same services into
+systemd-managed units on the host. Image references are fully qualified so
+Podman never has to guess a registry.
+
 ```yaml
 services:
   postgres:
-    image: postgres:16
+    image: docker.io/library/postgres:16
     environment:
       POSTGRES_USER: pm
       POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
@@ -52,7 +59,7 @@ services:
     restart: unless-stopped
 
   api:
-    build: { context: ., dockerfile: Dockerfile }      # pnpm install; pnpm --filter @pm/core build; pnpm -r build
+    build: { context: ., dockerfile: Containerfile }   # pnpm install; pnpm --filter @pm/core build; pnpm -r build
     command: ["node", "packages/api/dist/server.js"]
     env_file: .env.production
     environment:
@@ -65,7 +72,7 @@ services:
     restart: unless-stopped
 
   migrate:
-    build: { context: ., dockerfile: Dockerfile }
+    build: { context: ., dockerfile: Containerfile }
     command: ["pnpm", "db:migrate"]
     environment:
       DATABASE_URL: postgres://pm:${PG_PASSWORD}@postgres:5432/pmtool
@@ -74,7 +81,7 @@ services:
     restart: "no"
 
   proxy:
-    image: caddy:2
+    image: docker.io/library/caddy:2
     ports: ["80:80", "443:443"]
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro

@@ -8,8 +8,8 @@ From a clean machine to a running pm-tool with seeded data, an API key and the M
 |---|---|---|
 | Node.js | 22+ | `package.json` declares `"engines": { "node": ">=22" }` |
 | pnpm | 10 | `corepack enable` picks up `"packageManager": "pnpm@10.28.0"` automatically |
-| Docker | any recent | only for the bundled Postgres; skip it if you have Postgres 15+ |
-| Postgres | 15+ | `docker compose up -d postgres` starts Postgres 16 on `:5432` |
+| Podman | 4.1+ | only for the bundled Postgres; skip it if you have Postgres 15+. `podman compose` needs a provider: `pip install podman-compose` or `dnf/apt install podman-compose` |
+| Postgres | 15+ | `podman compose up -d postgres` starts Postgres 16 on `:5432` from `compose.yml` |
 | git | any | |
 
 ```bash
@@ -25,7 +25,7 @@ git clone https://github.com/jamjorf/pm-tool.git
 cd pm-tool
 
 cp .env.example .env
-docker compose up -d postgres        # or point DATABASE_URL at your own Postgres 15+
+podman compose up -d postgres        # or point DATABASE_URL at your own Postgres 15+
 pnpm install
 pnpm --filter @pm/core build         # other packages import @pm/core from its dist
 pnpm db:migrate && pnpm db:seed
@@ -133,7 +133,7 @@ Then ask Claude Code "what's on my plate in RATES?" and it will call `my_work` a
 | Symptom | Fix |
 |---|---|
 | `EADDRINUSE` on 3001 or 5173 | Something else is listening. Change `PORT` in `.env` for the API (and `API_URL` to match), or start the web app on another port with `pnpm --filter @pm/web exec vite --port 5174`. |
-| `ECONNREFUSED` / `password authentication failed` | Check `DATABASE_URL` in `.env` (default `postgres://postgres:postgres@localhost:5432/pmtool`) and that `docker compose ps` shows Postgres healthy. |
+| `ECONNREFUSED` / `password authentication failed` | Check `DATABASE_URL` in `.env` (default `postgres://postgres:postgres@localhost:5432/pmtool`) and that `podman compose ps` shows Postgres healthy (rootless Podman publishes `5432` on localhost by default). |
 | `Cannot find module '@pm/core'` or typecheck errors in api/web/mcp | Run `pnpm --filter @pm/core build` first. Other packages import `@pm/core` from its `dist`, so a fresh clone must build core before `pnpm -r typecheck`, `pnpm -r test` or `pnpm -r build`. |
 | React type errors from `react-router`, `cmdk`, `dnd-kit` | `.npmrc` hoists `@types/react` and `@types/react-dom` to the root (`public-hoist-pattern`). If you changed `.npmrc` or installed with another package manager, restore it and run `pnpm install` again. |
 | Seed says users already exist | `pnpm db:seed` is a no-op when any user exists. Use `pnpm --filter @pm/db seed --force` to wipe data tables and reseed, or start over below. |

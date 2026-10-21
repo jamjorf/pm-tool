@@ -41,7 +41,7 @@ pnpm -r build | pnpm -r typecheck | pnpm -r test | pnpm -r lint
 python3 scripts/build-prompt/gen.py  # regenerate docs/BUILD-PROMPT.md
 ```
 
-Per package: `pnpm --filter @pm/<name> <build|typecheck|test|dev>`. Local Postgres: `docker compose up -d postgres`, or any Postgres 15+ at `DATABASE_URL`.
+Per package: `pnpm --filter @pm/<name> <build|typecheck|test|dev>`. Local Postgres: `podman compose up -d postgres` (uses `compose.yml`), or any Postgres 15+ at `DATABASE_URL`.
 
 ### Build order
 
