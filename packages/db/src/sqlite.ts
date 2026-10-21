@@ -23,13 +23,39 @@
 // context (AsyncLocalStorage) run inside it, so passing `sql` or `tx` around
 // both work and nothing can deadlock on itself.
 // ============================================================================
-import { DatabaseSync } from 'node:sqlite';
+import type { DatabaseSync } from 'node:sqlite';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 export type Row = Record<string, any>;
+
+/**
+ * Load `node:sqlite` lazily through process.getBuiltinModule so that (a) the
+ * one-time "SQLite is an experimental feature" warning is silenced and (b)
+ * bundlers/test runners that cannot resolve the `node:sqlite` specifier
+ * (vite-node 2.x) still work, since there is no static import to rewrite.
+ */
+type SqliteModule = typeof import('node:sqlite');
+let sqliteModule: SqliteModule | undefined;
+function loadSqlite(): SqliteModule {
+  if (sqliteModule) return sqliteModule;
+  const orig = process.emitWarning;
+  (process as any).emitWarning = (warning: unknown, ...rest: unknown[]) => {
+    const type = typeof rest[0] === 'string' ? rest[0] : (rest[0] as any)?.type;
+    if (type === 'ExperimentalWarning' && /sqlite/i.test(String(warning))) return;
+    return (orig as any).call(process, warning, ...rest);
+  };
+  try {
+    const getBuiltin = (process as any).getBuiltinModule as ((id: string) => unknown) | undefined;
+    sqliteModule = (getBuiltin ? getBuiltin('node:sqlite') : undefined) as SqliteModule | undefined;
+    if (!sqliteModule) throw new Error('node:sqlite is not available; pm-tool needs Node.js 22.13 or newer');
+  } finally {
+    process.emitWarning = orig;
+  }
+  return sqliteModule;
+}
 
 // ---------------------------------------------------------------------------
 // Fragments & params
@@ -187,6 +213,7 @@ export function resolveDbPath(url: string | undefined = process.env.DATABASE_URL
 export function openDb(pathOrUrl?: string, opts: OpenOptions = {}): Sql {
   const path = resolveDbPath(pathOrUrl);
   if (path !== ':memory:' && (opts.mkdir ?? true)) mkdirSync(dirname(path), { recursive: true });
+  const { DatabaseSync } = loadSqlite();
   const db = new DatabaseSync(path);
   db.exec(`pragma busy_timeout = ${Math.max(0, opts.busyTimeout ?? 5000)}`);
   if (path !== ':memory:' && (opts.wal ?? true)) db.exec('pragma journal_mode = WAL');
