@@ -286,7 +286,8 @@ create index work_items_version_idx on work_items(version);
 
 -- Full-text search: an FTS5 index over key/title/description, kept in sync by
 -- triggers. Query with:  select id from work_items_fts where work_items_fts match ?
--- Rank with bm25(work_items_fts, 10.0, 5.0, 1.0) (key, title weigh more).
+-- Rank with bm25(work_items_fts, 0.0, 10.0, 5.0, 1.0): one weight per column INCLUDING the
+-- unindexed id (id, key, title, description); lower is better.
 create virtual table work_items_fts using fts5(
   id unindexed, key, title, description,
   tokenize = 'porter unicode61'

@@ -15,7 +15,7 @@ import { StateCategory, ViewKind } from '../schema/entities.js';
  *   "state.category" | "state.key"       (via workflow_states)
  *   "type.key"                           (via item_types)
  *   "project.key"                        (via projects)
- *   "fields.<key>"                       (JSONB type-specific field)
+ *   "fields.<key>"                       (JSON type-specific field)
  *   "labels"                             (array of label ids; ops: has / has_any / has_all / is_empty)
  *   "parent_id"                          (derived from relations parent_of)
  *   "is_blocked"                         (derived: has open blockers)

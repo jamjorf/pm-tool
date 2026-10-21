@@ -1,5 +1,5 @@
 // ============================================================================
-// Permission evaluator (pure). Mirrors effective_project_role()/can_view_item()
+// Permission evaluator (pure). Mirrors the effective_roles/visible_items views
 // in the SQL migration.
 // ============================================================================
 import type { Actor, Action, Resource, ProjectCtx, PermissionEvaluator } from './types.js';

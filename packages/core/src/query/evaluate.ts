@@ -102,7 +102,7 @@ function fieldDefsForItem(item: ItemRow, lookups: EvalLookups): FieldDef[] | und
   return lookups.types[item.type_id]?.field_defs;
 }
 
-/** Resolve a field + its value kind for one item (JSONB kinds come from the item's type defs). */
+/** Resolve a field + its value kind for one item (JSON field kinds come from the item's type defs). */
 function resolveForItem(field: FieldRef, item: ItemRow, lookups: EvalLookups): ResolvedField {
   const defs = fieldDefsForItem(item, lookups);
   const r = resolveField(field, defs ? [defs] : null);

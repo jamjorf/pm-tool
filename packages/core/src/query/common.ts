@@ -32,7 +32,7 @@ export function fieldDefValueKind(def: FieldDef): ValueKind {
   }
 }
 
-/** Find the FieldDef for a JSONB key in a set of type defs (first match wins). */
+/** Find the FieldDef for a JSON `fields` key in a set of type defs (first match wins). */
 export function findFieldDef(key: string, defsByType?: Record<string, FieldDef[]> | FieldDef[][] | null): FieldDef | null {
   if (!defsByType) return null;
   const lists = Array.isArray(defsByType) ? defsByType : Object.values(defsByType);
