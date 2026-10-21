@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { parseMutation, type PushRequest } from '@pm/core';
-import { isUuid, withTxn, type Sql } from '../db.js';
+import { isUuid, nowIso, withTxn, type Sql } from '../db.js';
 import { conflict, forbidden, toApiError } from '../errors.js';
 import { applyMutation } from '../mutations/index.js';
 import { createNotification } from '../notifications/rules.js';
@@ -11,7 +11,7 @@ import { pokeAfterCommit } from './poke.js';
 export async function ensureClientGroup(sql: Sql, groupId: string, userId: string) {
   const [g] = await sql`
     insert into sync_client_groups (id, user_id) values (${groupId}, ${userId})
-    on conflict (id) do update set last_seen_at = now()
+    on conflict (id) do update set last_seen_at = ${nowIso()}
     returning user_id`;
   if (g && g.user_id !== userId) throw forbidden('client group belongs to another user');
 }
@@ -24,9 +24,10 @@ function itemIdOf(args: unknown): string | null {
 }
 
 /**
- * POST /sync/push. Each mutation runs in its own locked transaction. Replays (id <= last) are
- * skipped, gaps (id > last+1) are rejected, failures are logged, still marked applied and
- * surfaced to the user as a `mutation_rejected` notification.
+ * POST /sync/push. Each mutation runs in its own write transaction (writers are serialised, so the
+ * plain select of last_mutation_id is exact). Replays (id <= last) are skipped, gaps (id > last+1)
+ * are rejected, failures are logged, still marked applied and surfaced to the user as a
+ * `mutation_rejected` notification.
  */
 export async function handlePush(app: FastifyInstance, request: FastifyRequest, body: PushRequest): Promise<Record<string, never>> {
   const actor = request.actor!;
@@ -36,8 +37,8 @@ export async function handlePush(app: FastifyInstance, request: FastifyRequest, 
   for (const m of body.mutations) {
     const meta = app.metaFor(request, m.name);
     const outcome = await withTxn(sql, async (tx) => {
-      const [client] = await tx`select last_mutation_id from sync_clients where id = ${m.clientID} for update`;
-      const last: number = client?.last_mutation_id ?? 0;
+      const [client] = await tx`select last_mutation_id from sync_clients where id = ${m.clientID}`;
+      const last: number = Number(client?.last_mutation_id ?? 0);
       if (!client) await tx`insert into sync_clients (id, client_group_id, last_mutation_id) values (${m.clientID}, ${body.clientGroupID}, 0)`;
       if (m.id <= last) return 'skip' as const;
       if (m.id > last + 1) throw conflict(`mutation ${m.id} from client ${m.clientID} is out of order (expected ${last + 1})`);
@@ -60,7 +61,8 @@ export async function handlePush(app: FastifyInstance, request: FastifyRequest, 
           body: e.details !== undefined ? `${e.message}\n${JSON.stringify(e.details)}` : e.message,
         });
       }
-      await tx`update sync_clients set last_mutation_id = ${m.id}, version = nextval('sync_version_seq'), last_seen_at = now() where id = ${m.clientID}`;
+      // sync_clients.version = the global version at which last_mutation_id changed (nextval in Postgres).
+      await tx`update sync_clients set last_mutation_id = ${m.id}, version = ${tx.nextVersion()}, last_seen_at = ${nowIso()} where id = ${m.clientID}`;
       return 'applied' as const;
     });
     if (outcome === 'applied') applied++;

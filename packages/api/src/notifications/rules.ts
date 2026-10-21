@@ -1,4 +1,4 @@
-import type { Q, Row, Tx } from '../db.js';
+import { nowIso, type Q, type Row, type Tx } from '../db.js';
 import type { MutationCtx, NotificationKind, PendingNotification } from '../mutations/context.js';
 import { DEFAULT_RULES } from '../mutations/notifications.js';
 
@@ -22,7 +22,7 @@ type Prefs = Record<string, Row>; // channel -> notification_preferences row
 async function loadPrefs(q: Q, userIds: string[]): Promise<Map<string, Prefs>> {
   const out = new Map<string, Prefs>();
   if (!userIds.length) return out;
-  const rows = await q`select * from notification_preferences where user_id = any(${userIds}::uuid[]) and deleted_at is null`;
+  const rows = await q`select * from notification_preferences where user_id in ${q(userIds)} and deleted_at is null`;
   for (const r of rows) {
     const p = out.get(r.user_id) ?? {};
     p[r.channel] = r;
@@ -85,12 +85,13 @@ export function scheduleFor(cadence: string, quiet: Record<string, unknown> | nu
 async function scheduleDelivery(q: Q, userId: string, channel: string, notificationId: string, cadence: string, quiet: Record<string, unknown> | null) {
   const at = scheduleFor(cadence, quiet).toISOString();
   const [pending] = await q`
-    select id from notification_deliveries where user_id = ${userId} and channel = ${channel} and sent_at is null and scheduled_for > now()
+    select id from notification_deliveries where user_id = ${userId} and channel = ${channel} and sent_at is null and scheduled_for > ${nowIso()}
     order by scheduled_for limit 1`;
   if (pending && cadence !== 'immediate') {
-    await q`update notification_deliveries set notification_ids = array_append(notification_ids, ${notificationId}) where id = ${pending.id}`;
+    // notification_ids is a JSON array: append (array_append in Postgres)
+    await q`update notification_deliveries set notification_ids = json_insert(notification_ids, '$[#]', ${notificationId}) where id = ${pending.id}`;
   } else {
-    await q`insert into notification_deliveries (user_id, channel, notification_ids, scheduled_for) values (${userId}, ${channel}, ${[notificationId]}::uuid[], ${at})`;
+    await q`insert into notification_deliveries (user_id, channel, notification_ids, scheduled_for) values (${userId}, ${channel}, ${[notificationId]}, ${at})`;
   }
 }
 

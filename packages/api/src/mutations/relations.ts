@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import type { MutationArgsOf } from '@pm/core';
-import type { Row } from '../db.js';
+import { nowIso, type Row } from '../db.js';
 import { notFound, validation } from '../errors.js';
 import type { MutationCtx } from './context.js';
-import { assertItem, canViewItem, getItem, itemSnapshot, touchItem } from './helpers.js';
+import { assertItem, canViewItem, getItem, itemSnapshot, reload, touchItem } from './helpers.js';
 
 export async function getRelation(ctx: MutationCtx, id: string): Promise<Row> {
   const [r] = await ctx.tx`select * from relations where id = ${id} and deleted_at is null`;
@@ -16,6 +16,12 @@ async function relationType(ctx: MutationCtx, key: string): Promise<Row> {
   if (!rt) throw validation(`unknown relation type "${key}"`);
   return rt;
 }
+
+/** The identity of an external reference: its `id`, else its `url` (mirrors relations.external_key). */
+const externalRefKey = (ref: unknown): string => {
+  const r = (ref ?? {}) as Record<string, unknown>;
+  return String(r.id ?? r.url ?? '');
+};
 
 export async function addRelation(ctx: MutationCtx, args: MutationArgsOf<'addRelation'>): Promise<Row> {
   const { tx, actor } = ctx;
@@ -34,35 +40,37 @@ export async function addRelation(ctx: MutationCtx, args: MutationArgsOf<'addRel
     }
     const [dup] = await tx`select * from relations where type = ${args.type} and from_item_id = ${from.id} and to_item_id = ${to.id} and deleted_at is null`;
     if (dup) return dup;
-    const [rel] = await tx`
-      insert into relations (id, type, from_item_id, to_item_id, created_by) values (${args.id}, ${args.type}, ${from.id}, ${to.id}, ${actor.id}) returning *`;
-    await ctx.emit([{ entity_type: 'relation', entity_id: rel!.id, item_id: from.id, project_id: from.project_id, action: 'relation_add', field: null, new_value: rel }]);
+    // Cycle / symmetric-duplicate checks are triggers (RAISE → 409 via toApiError).
+    await tx`insert into relations (id, type, from_item_id, to_item_id, created_by) values (${args.id}, ${args.type}, ${from.id}, ${to.id}, ${actor.id})`;
+    const rel = await reload(tx, 'relations', args.id);
+    await ctx.emit([{ entity_type: 'relation', entity_id: rel.id, item_id: from.id, project_id: from.project_id, action: 'relation_add', field: null, new_value: rel }]);
     if (rt.is_blocking) await touchItem(tx, to.id); // is_blocked is derived
-    return rel!;
+    return rel;
   }
 
   if (!args.external_kind || !args.external_ref) throw validation('external_kind and external_ref are required when to_item_id is not given');
   const ref = args.external_ref as Record<string, unknown>;
-  const refKey = String(ref.id ?? ref.url ?? '');
-  const [dup] = await tx`
-    select * from relations where type = ${args.type} and from_item_id = ${from.id} and external_kind = ${args.external_kind}
-      and coalesce(external_ref->>'id', external_ref->>'url', '') = ${refKey} and deleted_at is null`;
+  const refKey = externalRefKey(ref);
+  const candidates = await tx`
+    select * from relations where type = ${args.type} and from_item_id = ${from.id} and external_kind = ${args.external_kind} and deleted_at is null`;
+  const dup = candidates.find((r) => externalRefKey(r.external_ref) === refKey);
   if (dup) return dup;
-  const [rel] = await tx`
+  await tx`
     insert into relations (id, type, from_item_id, external_kind, external_ref, created_by)
-    values (${args.id}, ${args.type}, ${from.id}, ${args.external_kind}, ${tx.json(ref as any)}, ${actor.id}) returning *`;
-  await ctx.emit([{ entity_type: 'relation', entity_id: rel!.id, item_id: from.id, project_id: from.project_id, action: 'relation_add', field: null, new_value: rel }]);
-  return rel!;
+    values (${args.id}, ${args.type}, ${from.id}, ${args.external_kind}, ${tx.json(ref)}, ${actor.id})`;
+  const rel = await reload(tx, 'relations', args.id);
+  await ctx.emit([{ entity_type: 'relation', entity_id: rel.id, item_id: from.id, project_id: from.project_id, action: 'relation_add', field: null, new_value: rel }]);
+  return rel;
 }
 
 export async function removeRelation(ctx: MutationCtx, args: MutationArgsOf<'removeRelation'>): Promise<Row> {
   const rel = await getRelation(ctx, args.id);
   const from = await getItem(ctx.tx, rel.from_item_id);
   await assertItem(ctx, 'relation.edit', from);
-  const [after] = await ctx.tx`update relations set deleted_at = now() where id = ${rel.id} returning *`;
+  await ctx.tx`update relations set deleted_at = ${nowIso()} where id = ${rel.id}`;
   await ctx.emit([{ entity_type: 'relation', entity_id: rel.id, item_id: from.id, project_id: from.project_id, action: 'relation_remove', field: null, old_value: rel }]);
   if (rel.to_item_id) await touchItem(ctx.tx, rel.to_item_id);
-  return after!;
+  return reload(ctx.tx, 'relations', rel.id);
 }
 
 /**
@@ -80,7 +88,7 @@ export async function setParentInternal(
   const [current] = await tx`select * from relations where to_item_id = ${child.id} and type = 'parent_of' and deleted_at is null`;
   if (current && current.from_item_id === parentId) return current;
   if (current) {
-    await tx`update relations set deleted_at = now() where id = ${current.id}`;
+    await tx`update relations set deleted_at = ${nowIso()} where id = ${current.id}`;
     if (!opts.silent) await ctx.emit([{ entity_type: 'relation', entity_id: current.id, item_id: child.id, project_id: child.project_id, action: 'relation_remove', field: null, old_value: current }]);
   }
   let rel: Row | null = null;
@@ -88,10 +96,9 @@ export async function setParentInternal(
     if (parentId === child.id) throw validation('an item cannot be its own parent');
     const parent = await getItem(tx, parentId);
     if (!(await canViewItem(tx, actor.id, parent.id))) throw notFound(`item ${parentId} not found`);
-    const [r] = await tx`
-      insert into relations (id, type, from_item_id, to_item_id, created_by)
-      values (${opts.relationId ?? randomUUID()}, 'parent_of', ${parent.id}, ${child.id}, ${actor.id}) returning *`;
-    rel = r!;
+    const id = opts.relationId ?? randomUUID();
+    await tx`insert into relations (id, type, from_item_id, to_item_id, created_by) values (${id}, 'parent_of', ${parent.id}, ${child.id}, ${actor.id})`;
+    rel = await reload(tx, 'relations', id);
     if (!opts.silent) await ctx.emit([{ entity_type: 'relation', entity_id: rel.id, item_id: child.id, project_id: child.project_id, action: 'relation_add', field: null, new_value: rel }]);
   }
   if (!opts.silent) await touchItem(tx, child.id); // parent_id is derived

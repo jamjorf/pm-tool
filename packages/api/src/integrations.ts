@@ -100,20 +100,20 @@ export function buildIntegrationDeps(app: FastifyInstance): IntegrationDepsLike 
       return p ? { id: p.id, key: p.key, name: p.name, default_type_id: p.default_type_id } : null;
     },
     async resolveUserByEmail(email) {
-      const [u] = await sql`select id, name, email from users where lower(email) = lower(${email}) and deleted_at is null and is_active`;
+      const [u] = await sql`select id, name, email from users where lower(email) = lower(${email}) and deleted_at is null and is_active = 1`;
       return u ? { id: u.id, name: u.name, email: u.email } : null;
     },
     async resolveUserBySlackId(slackUserId) {
-      const [u] = await sql`select id, name, email from users where settings->>'slack_user_id' = ${slackUserId} and deleted_at is null and is_active`;
+      const [u] = await sql`select id, name, email from users where json_extract(settings, '$.slack_user_id') = ${slackUserId} and deleted_at is null and is_active = 1`;
       return u ? { id: u.id, name: u.name, email: u.email } : null;
     },
     async systemActor(label) {
       let [u] = await sql`select * from users where lower(email) = ${SERVICE_EMAIL} and deleted_at is null`;
-      if (!u) [u] = await sql`select * from users where is_service and deleted_at is null order by created_at limit 1`;
+      if (!u) [u] = await sql`select * from users where is_service = 1 and deleted_at is null order by created_at limit 1`;
       if (!u) {
         u = await withTxn(sql, async (tx) => {
-          const [row] = await tx`insert into users (email, name, firm_role, is_service) values (${SERVICE_EMAIL}, 'Agent', 'admin', true)
-            on conflict do nothing returning *`;
+          await tx`insert into users (email, name, firm_role, is_service) values (${SERVICE_EMAIL}, 'Agent', 'admin', 1) on conflict do nothing`;
+          const [row] = await tx`select * from users where lower(email) = ${SERVICE_EMAIL} and deleted_at is null`;
           return row ?? (await ensureServiceUser(tx, label));
         });
       }

@@ -10,7 +10,7 @@ export interface QueryResult {
   total: number;
 }
 
-/** Field defs by item type key (for typed JSONB filters/sorts). */
+/** Field defs by item type key (for typed JSON field filters/sorts). */
 export async function loadFieldDefs(q: Q): Promise<Record<string, FieldDef[]>> {
   const rows = await q`select key, field_defs from item_types where deleted_at is null`;
   const out: Record<string, FieldDef[]> = {};
@@ -22,7 +22,7 @@ function queryCtx(actor: Actor, tz?: string): QueryContext {
   return { userId: actor.id, tz: tz ?? 'UTC', now: new Date() };
 }
 
-/** Compile a spec with the permission scope attached. extraWhere values are numbered first ($1..). */
+/** Compile a spec with the permission scope attached (visibilityWhere → visible_items EXISTS). */
 function compileItems(spec: QuerySpec, actor: Actor, fieldDefs: Record<string, FieldDef[]>, opts: { select?: string; tz?: string } = {}) {
   const ctx = queryCtx(actor, opts.tz);
   const scope = visibilityWhere(actor.id, 0);
@@ -36,7 +36,7 @@ export async function queryItems(q: Q, actor: Actor, spec: QuerySpec, opts: { tz
   const compiled = compileItems(rowSpec, actor, fieldDefs, { tz: opts.tz });
   let rows: Row[];
   try {
-    rows = (await q.unsafe(compiled.text, compiled.values as any[])) as unknown as Row[];
+    rows = await q.unsafe(compiled.text, compiled.values as unknown[]);
   } catch (e) {
     throw validation(`query failed: ${(e as Error).message}`, { sql: compiled.text });
   }
@@ -48,19 +48,23 @@ export async function queryItems(q: Q, actor: Actor, spec: QuerySpec, opts: { tz
     // The compiler always emits ORDER BY, so count through a subquery rather than a custom select.
     const countSpec: QuerySpec = { ...spec, group_by: null, sort: undefined, limit: undefined, offset: undefined };
     const c = compileItems(countSpec, actor, fieldDefs, { tz: opts.tz, select: 'w.id' });
-    const [r] = (await q.unsafe(`select count(*)::int as total from (${c.text}) sub`, c.values as any[])) as unknown as Row[];
+    const [r] = await q.unsafe(`select count(*) as total from (${c.text}) sub`, c.values as unknown[]);
     total = Number(r?.total ?? rows.length);
   }
   const groups = spec.group_by ? await groupRows(q, rows, spec.group_by) : null;
   return { items: rows, groups, total };
 }
 
+const IN_CHUNK = 500;
+
 export async function attachLabelIds(q: Q, rows: Row[]) {
   if (!rows.length) return;
-  const ids = rows.map((r) => r.id);
-  const labels = await q`select item_id, label_id from work_item_labels where item_id = any(${ids}::uuid[]) and deleted_at is null order by created_at`;
   const by = new Map<string, string[]>();
-  for (const l of labels) (by.get(l.item_id) ?? by.set(l.item_id, []).get(l.item_id)!).push(l.label_id);
+  const ids = rows.map((r) => r.id);
+  for (let i = 0; i < ids.length; i += IN_CHUNK) {
+    const labels = await q`select item_id, label_id from work_item_labels where item_id in ${q(ids.slice(i, i + IN_CHUNK))} and deleted_at is null order by created_at`;
+    for (const l of labels) (by.get(l.item_id) ?? by.set(l.item_id, []).get(l.item_id)!).push(l.label_id);
+  }
   for (const r of rows) r.label_ids = by.get(r.id) ?? [];
 }
 
@@ -104,16 +108,16 @@ async function resolveLabels(q: Q, field: string, keys: string[]): Promise<Map<s
   if (!keys.length) return out;
   let rows: Row[] = [];
   switch (field) {
-    case 'state_id': rows = await q`select id::text as k, name as label from workflow_states where id = any(${keys}::uuid[])`; break;
-    case 'assignee_id': case 'reporter_id': case 'created_by': rows = await q`select id::text as k, name as label from users where id = any(${keys}::uuid[])`; break;
-    case 'type_id': rows = await q`select id::text as k, name as label from item_types where id = any(${keys}::uuid[])`; break;
-    case 'project_id': rows = await q`select id::text as k, key as label from projects where id = any(${keys}::uuid[])`; break;
-    case 'parent_id': rows = await q`select id::text as k, key || ' ' || title as label from work_items where id = any(${keys}::uuid[])`; break;
-    case 'labels': rows = await q`select id::text as k, name as label from labels where id = any(${keys}::uuid[])`; break;
+    case 'state_id': rows = await q`select id as k, name as label from workflow_states where id in ${q(keys)}`; break;
+    case 'assignee_id': case 'reporter_id': case 'created_by': rows = await q`select id as k, name as label from users where id in ${q(keys)}`; break;
+    case 'type_id': rows = await q`select id as k, name as label from item_types where id in ${q(keys)}`; break;
+    case 'project_id': rows = await q`select id as k, key as label from projects where id in ${q(keys)}`; break;
+    case 'parent_id': rows = await q`select id as k, key || ' ' || title as label from work_items where id in ${q(keys)}`; break;
+    case 'labels': rows = await q`select id as k, name as label from labels where id in ${q(keys)}`; break;
     case 'priority': for (const k of keys) out.set(k, PRIORITY_LABELS[Number(k)] ?? k); return out;
     default: return out;
   }
-  for (const r of rows) out.set(r.k, r.label);
+  for (const r of rows) out.set(String(r.k), r.label);
   return out;
 }
 
@@ -124,7 +128,7 @@ export async function runWidget(q: Q, actor: Actor, widget: Widget, opts: { tz?:
   const compiled = compileWidget(widget, ctx, { fieldDefs, extraWhere: [visibilityWhere(actor.id, 0)] });
   let rows: Row[];
   try {
-    rows = (await q.unsafe(compiled.text, compiled.values as any[])) as unknown as Row[];
+    rows = await q.unsafe(compiled.text, compiled.values as unknown[]);
   } catch (e) {
     throw validation(`widget ${widget.id} failed: ${(e as Error).message}`, { sql: compiled.text });
   }

@@ -15,7 +15,7 @@ export class PokeBus extends EventEmitter {
 
 export const pokeBus = new PokeBus();
 
-/** Emit a poke after a committed write with the latest global version. */
+/** Emit a poke after a committed write with the latest global version (sync_state.version). */
 export async function pokeAfterCommit(q: Q) {
   let version = 0;
   try {
