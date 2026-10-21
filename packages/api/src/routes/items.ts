@@ -3,10 +3,10 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { ItemPatch, QuerySpec, type Actor } from '@pm/core';
 import { requireAuth } from '../auth/plugin.js';
-import { escapeLike, ftsMatch, isUuid, nothing, type Q, type Row } from '../db.js';
+import { isUuid, type Q, type Row } from '../db.js';
 import { notFound, validation } from '../errors.js';
 import { workflowEngine } from '../core-compat.js';
-import { getItem, getProject, getType, getWorkflowDef, hasProjectRole, itemView, labelIdsSelect, resolveItemId, resolveProjectId, stripSearch, visibleItem } from '../mutations/helpers.js';
+import { canViewItem, getItem, getProject, getType, getWorkflowDef, itemView, resolveItemId, resolveProjectId, stripSearch } from '../mutations/helpers.js';
 import { loadGuardContext } from '../mutations/items.js';
 import { queryItems } from '../query.js';
 import { actorOf, csv, flag, intQuery, itemIdParam, parse, paramsOf, projectIdQuery, queryOf, resolveIds, zKeys, zUuid } from './util.js';
@@ -31,9 +31,6 @@ const ItemCreateBody = z.object({
   confidential: z.boolean().optional(),
 });
 
-/** item_rollup() returned one row of zeros for a leaf; the item_rollups view returns no row. */
-const EMPTY_ROLLUP = { total: 0, done: 0, in_progress: 0, todo: 0, canceled: 0, estimate_total: 0, estimate_done: 0 };
-
 async function resolveTypeId(q: Q, ref: string): Promise<string> {
   const rows = isUuid(ref) ? await q`select id from item_types where id = ${ref} and deleted_at is null` : await q`select id from item_types where key = ${ref} and deleted_at is null`;
   if (!rows[0]) throw notFound(`item type ${ref} not found`);
@@ -51,10 +48,9 @@ async function resolveLabelId(q: Q, projectId: string, ref: string): Promise<str
 async function visibleItemId(app: FastifyInstance, request: FastifyRequest, opts: { includeDeleted?: boolean } = {}): Promise<string> {
   const id = await itemIdParam(app.db, request, 'key', opts);
   const actor = actorOf(request);
-  const db = app.db;
-  const [row] = await db`
-    select ${visibleItem(db, actor.id, db`${id}`.fragment)} as ok,
-           (select (${hasProjectRole(db, actor.id, 'w.project_id')} and w.confidential = 0) from work_items w where w.id = ${id}) as deleted_ok`;
+  const [row] = await app.db`
+    select can_view_item(${actor.id}, ${id}) as ok,
+           (select effective_project_role(${actor.id}, w.project_id) is not null and not w.confidential from work_items w where w.id = ${id}) as deleted_ok`;
   if (!row?.ok && !(opts.includeDeleted && row?.deleted_ok)) throw notFound('item not found');
   return id;
 }
@@ -63,19 +59,12 @@ export async function availableTransitions(q: Q, actor: Actor, item: Row) {
   const project = await getProject(q, item.project_id);
   const type = await getType(q, item.type_id);
   const def = await getWorkflowDef(q, type.workflow_id);
-  const gctx = await loadGuardContext({ tx: q, actor }, item, project);
+  const gctx = await loadGuardContext({ tx: q as any, actor }, item, project);
   return workflowEngine.availableTransitions(def, item as any).map((t) => {
     const r = workflowEngine.evaluate(def, item as any, t.key, gctx);
     const to = def.states.find((s) => s.id === t.to_state_id)!;
     return { key: t.key, name: t.name, to_state: { id: to.id, key: to.key, name: to.name, category: to.category }, allowed: r.ok, failures: r.failures };
   });
-}
-
-/** Normalise an `updated_since` value to the stored ISO format so text comparison is exact. */
-function isoOrNull(v: string | null): string | null {
-  if (!v) return null;
-  const d = new Date(v);
-  return Number.isNaN(d.getTime()) ? v : d.toISOString();
 }
 
 export async function itemRoutes(app: FastifyInstance) {
@@ -93,7 +82,7 @@ export async function itemRoutes(app: FastifyInstance) {
     const assignee = qs.assignee === 'me' ? actor.id : qs.assignee && isUuid(qs.assignee) ? qs.assignee : null;
     const label = qs.label ?? null;
     const text = qs.q?.trim() || null;
-    const since = isoOrNull(qs.updated_since || null);
+    const since = qs.updated_since || null;
     const includeArchived = flag(qs.include_archived);
     let cursorAt: string | null = null, cursorId: string | null = null;
     if (qs.cursor) {
@@ -102,25 +91,19 @@ export async function itemRoutes(app: FastifyInstance) {
         cursorAt = c.u; cursorId = c.i;
       } catch { throw validation('invalid cursor'); }
     }
-    // q: FTS5 hit (quoted tokens) or case-insensitive title/key substring match
-    const match = text ? ftsMatch(text) : null;
-    const like = text ? `%${escapeLike(text.toLowerCase())}%` : null;
-    const textWhere = text
-      ? db`and (${match ? db`w.id in (select id from work_items_fts where work_items_fts match ${match}) or` : nothing(db)} lower(w.title) like ${like} escape '\\' or lower(w.key) like ${like} escape '\\')`
-      : nothing(db);
     const rows: Row[] = await db`
-      select w.*, ${labelIdsSelect(db)}
+      select w.*, coalesce((select array_agg(wl.label_id order by wl.created_at) from work_item_labels wl where wl.item_id = w.id and wl.deleted_at is null), '{}'::uuid[]) as label_ids
       from work_items_v w
-      where w.deleted_at is null and ${visibleItem(db, actor.id, 'w.id')}
-        and (${projectId} is null or w.project_id = ${projectId})
-        and (${typeRef} is null or w.type_key = ${typeRef} or w.type_id = ${typeRef})
-        ${categories ? db`and w.state_category in ${db(categories)}` : nothing(db)}
-        and (${assignee} is null or w.assignee_id = ${assignee})
-        and (${label} is null or exists (select 1 from work_item_labels wl join labels l on l.id = wl.label_id where wl.item_id = w.id and wl.deleted_at is null and (lower(l.name) = lower(${label}) or l.id = ${label})))
-        ${textWhere}
-        and (${since} is null or w.updated_at > ${since})
+      where w.deleted_at is null and can_view_item(${actor.id}, w.id)
+        and (${projectId}::uuid is null or w.project_id = ${projectId}::uuid)
+        and (${typeRef}::text is null or w.type_key = ${typeRef}::text or w.type_id::text = ${typeRef}::text)
+        and (${categories}::text[] is null or w.state_category::text = any(${categories}::text[]))
+        and (${assignee}::uuid is null or w.assignee_id = ${assignee}::uuid)
+        and (${label}::text is null or exists (select 1 from work_item_labels wl join labels l on l.id = wl.label_id where wl.item_id = w.id and wl.deleted_at is null and (lower(l.name) = lower(${label}::text) or l.id::text = ${label}::text)))
+        and (${text}::text is null or w.search @@ websearch_to_tsquery('english', ${text}::text) or w.title ilike ${'%' + (text ?? '') + '%'} or w.key ilike ${'%' + (text ?? '') + '%'})
+        and (${since}::timestamptz is null or w.updated_at > ${since}::timestamptz)
         and (${includeArchived} or w.archived_at is null)
-        and (${cursorAt} is null or (w.updated_at, w.id) < (${cursorAt}, ${cursorId}))
+        and (${cursorAt}::timestamptz is null or (w.updated_at, w.id) < (${cursorAt}::timestamptz, ${cursorId}::uuid))
       order by w.updated_at desc, w.id desc
       limit ${limit + 1}`;
     const more = rows.length > limit;
@@ -180,7 +163,7 @@ export async function itemRoutes(app: FastifyInstance) {
     const rels = await db`
       select r.*, rt.name as type_name, rt.inverse_name as type_inverse_name,
         o.id as o_id, o.key as o_key, o.title as o_title, o.state_name as o_state, o.state_category as o_state_category, o.assignee_id as o_assignee_id,
-        (o.id is null or ${visibleItem(db, actor.id, 'o.id')}) as o_visible
+        (o.id is null or can_view_item(${actor.id}, o.id)) as o_visible
       from relations r join relation_types rt on rt.key = r.type
       left join work_items_v o on o.id = case when r.from_item_id = ${id} then r.to_item_id else r.from_item_id end
       where (r.from_item_id = ${id} or r.to_item_id = ${id}) and r.deleted_at is null
@@ -196,16 +179,15 @@ export async function itemRoutes(app: FastifyInstance) {
     });
     const [parent] = await db`
       select w.id, w.key, w.title, w.state_name as state, w.state_category from relations r join work_items_v w on w.id = r.from_item_id
-      where r.to_item_id = ${id} and r.type = 'parent_of' and r.deleted_at is null and w.deleted_at is null and ${visibleItem(db, actor.id, 'w.id')}`;
+      where r.to_item_id = ${id} and r.type = 'parent_of' and r.deleted_at is null and w.deleted_at is null and can_view_item(${actor.id}, w.id)`;
     const children = await db`
       select w.id, w.key, w.title, w.state_name as state, w.state_category, w.assignee_id, w.priority, w.type_key from relations r join work_items_v w on w.id = r.to_item_id
-      where r.from_item_id = ${id} and r.type = 'parent_of' and r.deleted_at is null and w.deleted_at is null and ${visibleItem(db, actor.id, 'w.id')}
+      where r.from_item_id = ${id} and r.type = 'parent_of' and r.deleted_at is null and w.deleted_at is null and can_view_item(${actor.id}, w.id)
       order by w.sort_order, w.number`;
-    const [rollupRow] = await db`select total, done, in_progress, todo, canceled, estimate_total, estimate_done from item_rollups where root_id = ${id}`;
-    const rollup = rollupRow ?? { ...EMPTY_ROLLUP };
+    const [rollup] = await db`select * from item_rollup(${id})`;
     const watchers = await db`select w.user_id, u.name, w.reason, w.muted from item_watchers w join users u on u.id = w.user_id where w.item_id = ${id} and w.deleted_at is null`;
     const available_transitions = await availableTransitions(db, actor, item);
-    return { item, labels, relations, parent: parent ?? null, children, rollup, available_transitions, watchers };
+    return { item, labels, relations, parent: parent ?? null, children, rollup: rollup ?? null, available_transitions, watchers };
   });
 
   app.patch('/items/:key', async (request) => {
@@ -250,7 +232,7 @@ export async function itemRoutes(app: FastifyInstance) {
     const events = await db`
       select e.*, u.name as actor_name from activity_events e left join users u on u.id = e.actor_id
       where (e.item_id = ${id} or (e.entity_type = 'relation' and e.entity_id in (select id from relations where to_item_id = ${id})))
-        and (${before} is null or e.id < ${before})
+        and (${before}::bigint is null or e.id < ${before}::bigint)
       order by e.id desc limit ${limit}`;
     return { events, next_before: events.length === limit ? events.at(-1)!.id : null };
   });
@@ -278,7 +260,7 @@ export async function itemRoutes(app: FastifyInstance) {
     const relations = await db`
       select r.*, o.key as other_key, o.title as other_title, o.state_name as other_state
       from relations r left join work_items_v o on o.id = case when r.from_item_id = ${id} then r.to_item_id else r.from_item_id end
-      where (r.from_item_id = ${id} or r.to_item_id = ${id}) and r.deleted_at is null and (o.id is null or ${visibleItem(db, actor.id, 'o.id')})
+      where (r.from_item_id = ${id} or r.to_item_id = ${id}) and r.deleted_at is null and (o.id is null or can_view_item(${actor.id}, o.id))
       order by r.created_at`;
     return { relations };
   });
@@ -334,4 +316,6 @@ export async function itemRoutes(app: FastifyInstance) {
     const id = await visibleItemId(app, request);
     return app.mutateFor(request, { name: 'unwatchItem', args: { item_id: id } });
   });
+
+  void canViewItem;
 }

@@ -1,5 +1,5 @@
 import type { Actor, Action, ItemCtx, ProjectCtx, WorkflowDefinition, WorkItem, WatchReason } from '@pm/core';
-import { isUuid, nowIso, type Fragment, type Q, type Row } from '../db.js';
+import { isUuid, type Q, type Row } from '../db.js';
 import { notFound, validation } from '../errors.js';
 import { permissions } from '../core-compat.js';
 import type { MutationCtx } from './context.js';
@@ -12,63 +12,8 @@ export const ITEM_COLUMNS = new Set([
   'estimate', 'fields', 'confidential', 'sort_order', 'archived_at', 'completed_at', 'canceled_at', 'project_id',
 ]);
 
-/** The Postgres schema exposed a `search` tsvector on work_items; kept as a no-op guard for rows that still carry one. */
 export function stripSearch<T extends Row>(row: T): T {
   if (row && 'search' in row) delete (row as any).search;
-  return row;
-}
-
-// ---------------------------------------------------------------------------
-// Permission predicates (SQL views replace the Postgres functions)
-// ---------------------------------------------------------------------------
-
-/** `exists (...)` fragment: can `userId` see the item whose id is `col` (a column reference or a bound value)? */
-export function visibleItem(q: Q, userId: string, col: string | Fragment): Fragment {
-  const ref = typeof col === 'string' ? q.raw(col) : col;
-  return q`exists (select 1 from visible_items vi where vi.user_id = ${userId} and vi.item_id = ${ref})`.fragment;
-}
-
-/** `(select project_id ...)` fragment: the projects `userId` has an effective role in (use with `in`). */
-export function visibleProjects(q: Q, userId: string): Fragment {
-  return q`(select er.project_id from effective_roles er where er.user_id = ${userId})`.fragment;
-}
-
-/** `exists (...)` fragment: does `userId` have any role in the project `col`? */
-export function hasProjectRole(q: Q, userId: string, col: string | Fragment): Fragment {
-  const ref = typeof col === 'string' ? q.raw(col) : col;
-  return q`exists (select 1 from effective_roles er where er.user_id = ${userId} and er.project_id = ${ref})`.fragment;
-}
-
-export async function effectiveRoleOf(q: Q, userId: string, projectId: string): Promise<string | null> {
-  const [r] = await q`select role from effective_roles where user_id = ${userId} and project_id = ${projectId}`;
-  return r?.role ?? null;
-}
-
-export async function canViewItem(q: Q, userId: string, itemId: string): Promise<boolean> {
-  const [r] = await q`select exists (select 1 from visible_items vi where vi.user_id = ${userId} and vi.item_id = ${itemId}) as ok`;
-  return !!r?.ok;
-}
-
-/** `label_ids` select-list fragment (JSON array of label ids in attach order; hydrated to a JS array). */
-export function labelIdsSelect(q: Q, alias = 'w'): Fragment {
-  return q.raw(
-    `(select json_group_array(label_id) from (select wl.label_id from work_item_labels wl where wl.item_id = ${alias}.id and wl.deleted_at is null order by wl.created_at)) as label_ids`,
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Row access
-// ---------------------------------------------------------------------------
-const RELOADABLE = new Set([
-  'users', 'teams', 'workflows', 'workflow_states', 'workflow_transitions', 'item_types', 'projects', 'work_items', 'labels',
-  'comments', 'attachments', 'relations', 'views', 'notifications', 'webhook_endpoints',
-]);
-
-/** Re-read a row by id. Needed after INSERT/UPDATE because the version/number/key triggers run after RETURNING. */
-export async function reload(q: Q, table: string, id: string): Promise<Row> {
-  if (!RELOADABLE.has(table)) throw new Error(`reload: unknown table ${table}`);
-  const [row] = await q`select * from ${q.raw(table)} where id = ${id}`;
-  if (!row) throw notFound(`${table} ${id} not found`);
   return row;
 }
 
@@ -138,12 +83,17 @@ export async function assertItem(ctx: MutationCtx, action: Action, item: Row): P
   return project;
 }
 
+export async function canViewItem(q: Q, userId: string, itemId: string): Promise<boolean> {
+  const [r] = await q`select can_view_item(${userId}, ${itemId}) as ok`;
+  return !!r?.ok;
+}
+
 /** Insert or revive a watcher row (no-op when it already exists, so no version churn). */
 export async function ensureWatcher(ctx: MutationCtx, itemId: string, userId: string, reason: WatchReason) {
   await ctx.tx`
     insert into item_watchers (item_id, user_id, reason) values (${itemId}, ${userId}, ${reason})
     on conflict (item_id, user_id) do update set deleted_at = null, reason = excluded.reason
-    where deleted_at is not null`;
+    where item_watchers.deleted_at is not null`;
 }
 
 export async function userName(q: Q, userId: string | null | undefined): Promise<string | null> {
@@ -173,32 +123,33 @@ export async function parentIdOf(q: Q, itemId: string): Promise<string | null> {
 export async function itemSnapshot(q: Q, itemId: string): Promise<Row> {
   const [row] = await q`
     select w.*,
-      ${labelIdsSelect(q)},
+      coalesce((select array_agg(wl.label_id order by wl.created_at) from work_item_labels wl where wl.item_id = w.id and wl.deleted_at is null), '{}'::uuid[]) as label_ids,
       (select r.from_item_id from relations r where r.to_item_id = w.id and r.type = 'parent_of' and r.deleted_at is null) as parent_id,
-      exists (select 1 from open_blockers ob where ob.item_id = w.id) as is_blocked
+      exists(select 1 from item_open_blockers(w.id)) as is_blocked
     from work_items w where w.id = ${itemId}`;
   if (!row) throw notFound(`item ${itemId} not found`);
   return stripSearch(row);
 }
 
-/** work_items_v row (display columns) plus label_ids. */
+/** work_items_v row (display columns) without the tsvector. */
 export async function itemView(q: Q, itemId: string): Promise<Row | null> {
-  const [row] = await q`select w.*, ${labelIdsSelect(q)} from work_items_v w where w.id = ${itemId}`;
+  const [row] = await q`
+    select w.*, coalesce((select array_agg(wl.label_id order by wl.created_at) from work_item_labels wl where wl.item_id = w.id and wl.deleted_at is null), '{}'::uuid[]) as label_ids
+    from work_items_v w where w.id = ${itemId}`;
   return row ? stripSearch(row) : null;
 }
 
 /** Bump a row's version (and updated_at) so sync clients re-pull derived columns (is_blocked, parent_id, label_ids). */
 export async function touchItem(q: Q, itemId: string) {
-  await q`update work_items set updated_at = ${nowIso()} where id = ${itemId}`;
+  await q`update work_items set updated_at = now() where id = ${itemId}`;
 }
 
 /** Re-version child rows of an item so deletes/restores propagate to sync clients. */
 export async function touchItemChildren(q: Q, itemId: string) {
-  const now = nowIso();
-  await q`update comments set updated_at = ${now} where item_id = ${itemId}`;
-  await q`update relations set updated_at = ${now} where from_item_id = ${itemId} or to_item_id = ${itemId}`;
-  await q`update work_item_labels set updated_at = ${now} where item_id = ${itemId}`;
-  await q`update item_watchers set updated_at = ${now} where item_id = ${itemId}`;
+  await q`update comments set updated_at = now() where item_id = ${itemId}`;
+  await q`update relations set updated_at = now() where from_item_id = ${itemId} or to_item_id = ${itemId}`;
+  await q`update work_item_labels set updated_at = now() where item_id = ${itemId}`;
+  await q`update item_watchers set updated_at = now() where item_id = ${itemId}`;
 }
 
 export function requireUuid(v: unknown, what: string): string {

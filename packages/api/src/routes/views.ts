@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { MutationArgs, QuerySpec, ViewSpec, type Widget } from '@pm/core';
 import { requireAuth } from '../auth/plugin.js';
 import { notFound } from '../errors.js';
-import { resolveProjectId, visibleProjects } from '../mutations/helpers.js';
+import { resolveProjectId } from '../mutations/helpers.js';
 import { queryItems, runWidget } from '../query.js';
 import { actorOf, parse, paramsOf, projectIdQuery, zUuid } from './util.js';
 
@@ -18,8 +18,8 @@ export async function viewRoutes(app: FastifyInstance) {
     const views = await db`
       select v.* from views v
       where v.deleted_at is null
-        and (${projectId} is null or v.project_id = ${projectId})
-        and (v.owner_id = ${actor.id} or (v.is_shared = 1 and (v.project_id is null or v.project_id in ${visibleProjects(db, actor.id)})))
+        and (${projectId}::uuid is null or v.project_id = ${projectId}::uuid)
+        and (v.owner_id = ${actor.id} or (v.is_shared and (v.project_id is null or v.project_id in (select visible_project_ids(${actor.id})))))
       order by v.project_id nulls first, v.sort, v.name`;
     return { views };
   });
@@ -48,7 +48,7 @@ export async function viewRoutes(app: FastifyInstance) {
     const actor = actorOf(request);
     const [view] = await db`
       select * from views where id = ${paramsOf(request).id!} and deleted_at is null
-        and (owner_id = ${actor.id} or (is_shared = 1 and (project_id is null or project_id in ${visibleProjects(db, actor.id)})))`;
+        and (owner_id = ${actor.id} or (is_shared and (project_id is null or project_id in (select visible_project_ids(${actor.id})))))`;
     if (!view) throw notFound('view not found');
     const body = parse(z.object({ spec: QuerySpec.partial().optional(), tz: z.string().optional() }), request.body);
     const spec = ViewSpec.parse(view.spec ?? {});

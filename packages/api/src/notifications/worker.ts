@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { isoIn, nowIso, type Row, type Sql } from '../db.js';
+import type { Row, Sql } from '../db.js';
 import type { IntegrationsModule, OutboundNotificationLike } from '../integrations.js';
 
 /** Build the outbound model for a notification row (+ its item summary). */
@@ -19,29 +19,22 @@ async function outbound(sql: Sql, appUrl: string, n: Row): Promise<OutboundNotif
   return { kind: n.kind, title: n.title, body: n.body, item, actorName: actor?.name ?? null, createdAt: n.created_at };
 }
 
-/**
- * One pass: send due email/slack deliveries through @pm/integrations (or log when unavailable).
- * Due rows are claimed (sent_at stamped) in one short write transaction, then sent with no
- * transaction open: the process is the single writer, so this replaces `for update skip locked`.
- */
+/** One pass: send due email/slack deliveries through @pm/integrations (or log when unavailable). */
 export async function processNotificationDeliveries(app: FastifyInstance, integrations: IntegrationsModule | null, batch = 50): Promise<number> {
   const sql = app.db;
-  const due: Row[] = await sql.begin(async (tx) => {
-    const now = nowIso();
+  const due: Row[] = (await sql.begin(async (tx) => {
     const rows = await tx`
-      select * from notification_deliveries
-      where sent_at is null and scheduled_for <= ${now} and (error is null or created_at > ${isoIn(-86_400_000)})
-      order by scheduled_for, id limit ${batch}`;
-    if (rows.length) await tx`update notification_deliveries set sent_at = ${now} where id in ${tx(rows.map((r) => r.id))}`;
+      select * from notification_deliveries where sent_at is null and scheduled_for <= now() and (error is null or created_at > now() - interval '1 day')
+      order by scheduled_for, id limit ${batch} for update skip locked`;
+    if (rows.length) await tx`update notification_deliveries set sent_at = now() where id = any(${rows.map((r) => r.id)}::bigint[])`;
     return rows;
-  });
+  })) as unknown as Row[];
 
   for (const d of due) {
     try {
-      const ids: string[] = Array.isArray(d.notification_ids) ? d.notification_ids : [];
-      const notes = ids.length ? await sql`select * from notifications where id in ${sql(ids)} and deleted_at is null order by created_at` : [];
+      const notes = await sql`select * from notifications where id = any(${d.notification_ids}::uuid[]) and deleted_at is null order by created_at`;
       if (!notes.length) continue;
-      const [user] = await sql`select id, email, name, settings from users where id = ${d.user_id} and deleted_at is null and is_active = 1`;
+      const [user] = await sql`select id, email, name, settings from users where id = ${d.user_id} and deleted_at is null and is_active`;
       if (!user) continue;
       const items = [];
       for (const n of notes) items.push(await outbound(sql, app.config.APP_URL, n));
@@ -62,7 +55,7 @@ export async function processNotificationDeliveries(app: FastifyInstance, integr
       }
     } catch (e) {
       app.log.warn({ err: e, delivery: d.id }, 'notification delivery failed');
-      await sql`update notification_deliveries set sent_at = null, error = ${(e as Error).message}, scheduled_for = ${isoIn(10 * 60_000)} where id = ${d.id}`;
+      await sql`update notification_deliveries set sent_at = null, error = ${(e as Error).message}, scheduled_for = now() + interval '10 minutes' where id = ${d.id}`;
     }
   }
   return due.length;

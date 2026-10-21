@@ -32,7 +32,7 @@ export function fieldDefValueKind(def: FieldDef): ValueKind {
   }
 }
 
-/** Find the FieldDef for a JSON `fields` key in a set of type defs (first match wins). */
+/** Find the FieldDef for a JSONB key in a set of type defs (first match wins). */
 export function findFieldDef(key: string, defsByType?: Record<string, FieldDef[]> | FieldDef[][] | null): FieldDef | null {
   if (!defsByType) return null;
   const lists = Array.isArray(defsByType) ? defsByType : Object.values(defsByType);
@@ -183,26 +183,7 @@ export function withinDaysBounds(kind: 'date' | 'datetime', n: number, ctx: Quer
   return { start: startOfDayInTz(a, tz), end: startOfDayInTz(addDays(b, 1), tz) };
 }
 
-export type TimeBucket = 'day' | 'week' | 'month';
-
-/**
- * Calendar bucket of a date ('YYYY-MM-DD') or ISO timestamp, computed on the UTC
- * calendar date (the first 10 characters) exactly like the SQL compiler's
- * time_bucket: day → the date, week → its Monday, month → its first day.
- * Returns null for null/undefined or non-date input.
- */
-export function timeBucket(value: unknown, bucket: TimeBucket): string | null {
-  if (value === null || value === undefined) return null;
-  const day = (value instanceof Date ? value.toISOString() : String(value)).slice(0, 10);
-  if (!DATE_ONLY_RE.test(day)) return null;
-  switch (bucket) {
-    case 'day': return day;
-    case 'month': return `${day.slice(0, 7)}-01`;
-    case 'week': return addDays(day, -isoWeekday(day));
-  }
-}
-
-/** Escape a value for use inside a LIKE pattern (backslash escape; emit `escape '\'`). */
+/** Escape a value for use inside a LIKE/ILIKE pattern (default backslash escape). */
 export function escapeLike(s: string): string {
   return s.replace(/[\\%_]/g, (c) => `\\${c}`);
 }

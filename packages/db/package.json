@@ -6,22 +6,9 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    },
-    "./migrate": {
-      "types": "./dist/migrate.d.ts",
-      "import": "./dist/migrate.js"
-    },
-    "./seed": {
-      "types": "./dist/seed.d.ts",
-      "import": "./dist/seed.js"
-    },
-    "./sqlite": {
-      "types": "./dist/sqlite.d.ts",
-      "import": "./dist/sqlite.js"
-    }
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./migrate": { "types": "./dist/migrate.d.ts", "import": "./dist/migrate.js" },
+    "./seed": { "types": "./dist/seed.d.ts", "import": "./dist/seed.js" }
   },
   "scripts": {
     "migrate": "tsx src/migrate.ts",
@@ -33,6 +20,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "postgres": "^3.4.5",
     "tsx": "^4.19.2"
   },
   "devDependencies": {

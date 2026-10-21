@@ -1,0 +1,21 @@
+# Local Postgres for development. Written for Podman:
+#   podman compose up -d postgres        (Podman 4.1+; needs podman-compose or docker-compose installed as the provider)
+# The file follows the Compose specification, so `docker compose` reads it unchanged.
+services:
+  postgres:
+    image: docker.io/library/postgres:16   # fully qualified so Podman never asks which registry to use
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pmtool
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pmtool"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  pgdata:

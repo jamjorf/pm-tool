@@ -21,16 +21,13 @@ One table, `work_items`, with:
   `start_date`, `due_date`, `estimate`, `confidential`, `sort_order`, …);
 * `type_id → item_types`, whose `field_defs` (a JSON array of `FieldDef`)
   declares the type-specific fields;
-* `fields` (a JSON object stored as text, `check (json_valid(fields) and
-  json_type(fields) = 'object')`) holding those values, validated by database
-  triggers (`work_items_validate_fields_*`: unknown keys, required keys, JSON
-  types, via `json_each`/`json_type`) and by the zod schema generated from
-  the same `field_defs` in `@pm/core` (option membership, user existence,
-  min/max);
-* a per-project `number`/`key` (`RATES-12`) assigned by an AFTER INSERT
-  trigger;
-* an FTS5 table `work_items_fts` over key/title/description kept in sync by
-  triggers; hot `fields` keys get expression indexes on `json_extract`.
+* `fields jsonb` holding those values, validated by a database trigger
+  (`trg_validate_item_fields`: unknown keys, required keys, JSON types) and
+  by the zod schema generated from the same `field_defs` in `@pm/core`
+  (option membership, user existence, min/max);
+* a per-project `number`/`key` (`RATES-12`) assigned by trigger;
+* GIN indexes on `fields` (`jsonb_path_ops`) and on the generated `search`
+  tsvector.
 
 Adding a type or a field is an `INSERT`/`UPDATE` on `item_types`. Adding a
 column is a migration, reserved for attributes every type needs.
@@ -40,11 +37,10 @@ column is a migration, reserved for attributes every type needs.
 * (+) One API, one query layer (`fields.<key>` is a first-class `FieldRef`),
   one activity log (`fields.<key>` rows), one sync table, one search index.
 * (+) Desks iterate without engineering: new types are product decisions.
-* (+) The JSON is honest: the trigger rejects garbage regardless of client.
-* (−) JSON fields are not foreign keys; referential checks for `user` fields
+* (+) The JSONB is honest: the trigger rejects garbage regardless of client.
+* (−) JSONB fields are not foreign keys; referential checks for `user` fields
   are in application code.
-* (−) Aggregations over JSON numbers go through `json_extract(fields, '$.notional')`
-  and cannot use an ordinary column index without an expression index;
+* (−) Aggregations over JSONB numbers need casts (`(fields->>'notional')::numeric`);
   heavy analytical use of a field is the signal to promote it to a column.
 * (−) Removing a field requires clearing values first (the trigger rejects
   unknown keys on the next write).

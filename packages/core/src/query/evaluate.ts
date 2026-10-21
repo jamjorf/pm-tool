@@ -1,9 +1,6 @@
 // ============================================================================
 // Client-side QuerySpec evaluator. Semantics mirror query/compile.ts exactly
-// (asserted by query/parity.test.ts against an in-memory SQLite database with
-// the real migration applied). Rows are the shape @pm/db hydrates from
-// work_items_v: `fields` parsed, `label_names` an array, is_blocked/confidential
-// booleans, dates 'YYYY-MM-DD' text and timestamps ISO text.
+// (asserted by query/parity.test.ts against a real Postgres).
 // ============================================================================
 import type { FilterExpr, QuerySpec, QueryContext, SortSpec, FieldRef, ValueMacro } from './spec.js';
 import { STATE_CATEGORY_ORDER } from './spec.js';
@@ -102,7 +99,7 @@ function fieldDefsForItem(item: ItemRow, lookups: EvalLookups): FieldDef[] | und
   return lookups.types[item.type_id]?.field_defs;
 }
 
-/** Resolve a field + its value kind for one item (JSON field kinds come from the item's type defs). */
+/** Resolve a field + its value kind for one item (JSONB kinds come from the item's type defs). */
 function resolveForItem(field: FieldRef, item: ItemRow, lookups: EvalLookups): ResolvedField {
   const defs = fieldDefsForItem(item, lookups);
   const r = resolveField(field, defs ? [defs] : null);

@@ -1,40 +1,33 @@
-import { escapeLike, ftsMatch, nothing, type Q, type Row } from './db.js';
-import { stripSearch, visibleItem } from './mutations/helpers.js';
+import type { Q, Row } from './db.js';
+import { stripSearch } from './mutations/helpers.js';
 import { attachLabelIds } from './query.js';
 
 export interface SearchOptions { projectId?: string | null; limit?: number }
 
 /**
- * Full-text search over work_items_v through the FTS5 index (work_items_fts: key, title, description),
- * ranked with bm25 (weights per column: id 0, key 10, title 5, description 1) and a `**`-highlighted
- * snippet from the best-matching column; falls back to a
- * case-insensitive title/key substring match when FTS finds nothing. Always scoped by visible_items.
- * `rank` is exposed as a positive number (higher = better; bm25 itself is lower-is-better).
+ * Full-text search over work_items_v with ranking + ts_headline snippet; falls back to a
+ * trigram/ILIKE title match when FTS finds nothing. Always scoped by can_view_item().
  */
 export async function searchItems(q: Q, userId: string, query: string, opts: SearchOptions = {}): Promise<Row[]> {
   const text = query.trim();
   const limit = Math.min(Math.max(opts.limit ?? 20, 1), 200);
   if (!text) return [];
   const pid = opts.projectId ?? null;
-  const scope = q`w.deleted_at is null and ${visibleItem(q, userId, 'w.id')} and (${pid} is null or w.project_id = ${pid})`;
-  const match = ftsMatch(text);
-  let rows: Row[] = [];
-  if (match) {
-    rows = await q`
-      select w.*, -f.rank as rank, f.snippet as snippet
-      from (select f.id, bm25(f.work_items_fts, 0.0, 10.0, 5.0, 1.0) as rank, snippet(f.work_items_fts, -1, '**', '**', '…', 12) as snippet
-            from work_items_fts f where f.work_items_fts match ${match}) f
-      join work_items_v w on w.id = f.id
-      where ${scope}
-      order by f.rank asc, w.updated_at desc
-      limit ${limit}`;
-  }
+  let rows: Row[] = await q`
+    select w.*, ts_rank(w.search, qq.q) as rank,
+           ts_headline('english', w.title || ' — ' || left(w.description, 2000), qq.q, 'MaxFragments=2, MaxWords=18, MinWords=6, StartSel=**, StopSel=**') as snippet
+    from work_items_v w, websearch_to_tsquery('english', ${text}) qq(q)
+    where w.deleted_at is null and w.search @@ qq.q and can_view_item(${userId}, w.id)
+      and (${pid}::uuid is null or w.project_id = ${pid}::uuid)
+    order by rank desc, w.updated_at desc
+    limit ${limit}`;
   if (!rows.length) {
-    const like = `%${escapeLike(text.toLowerCase())}%`;
     rows = await q`
-      select w.*, case when lower(w.key) like ${like} escape '\\' then 1.0 else 0.5 end as rank, w.title as snippet
+      select w.*, greatest(similarity(w.title, ${text}), case when w.key ilike ${'%' + text + '%'} then 1.0 else 0 end) as rank, w.title as snippet
       from work_items_v w
-      where ${scope} and (lower(w.title) like ${like} escape '\\' or lower(w.key) like ${like} escape '\\')
+      where w.deleted_at is null and can_view_item(${userId}, w.id)
+        and (${pid}::uuid is null or w.project_id = ${pid}::uuid)
+        and (w.title % ${text} or w.title ilike ${'%' + text + '%'} or w.key ilike ${'%' + text + '%'})
       order by rank desc, w.updated_at desc
       limit ${limit}`;
   }
@@ -42,5 +35,3 @@ export async function searchItems(q: Q, userId: string, query: string, opts: Sea
   await attachLabelIds(q, rows);
   return rows;
 }
-
-export { nothing };

@@ -34,7 +34,7 @@ export async function ensureServiceUser(q: Q, label: string): Promise<UserRow> {
   const email = `${label}@system.local`;
   const [existing] = await q`select * from users where lower(email) = lower(${email}) and deleted_at is null`;
   if (existing) return existing as UserRow;
-  await q`insert into users (email, name, firm_role, is_service) values (${email}, ${label}, 'admin', 1)`;
-  const [created] = await q`select * from users where lower(email) = lower(${email}) and deleted_at is null`;
+  const [created] = await q`
+    insert into users (email, name, firm_role, is_service) values (${email}, ${label}, 'admin', true) returning *`;
   return created as UserRow;
 }

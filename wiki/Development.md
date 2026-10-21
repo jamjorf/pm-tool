@@ -7,7 +7,7 @@ How the repository is laid out, what to run, and the conventions every change mu
 ```
 docs/                  01-data-model · 02-design · 03-ux · 04-integrations · 05-operations · adr/ · BUILD-PROMPT
 wiki/                  this wiki; synced to the GitHub Wiki by .github/workflows/wiki.yml
-packages/db            migrations/*.sql, src/{sqlite,client,migrate,seed,reset}.ts   (sqlite.ts is the runtime layer)
+packages/db            migrations/*.sql, src/{migrate,seed,reset,client}.ts
 packages/core          src/{schema,query,workflow,permissions}, fields.ts, events.ts, mutations.ts
 packages/api           src/{auth,mutations,sync,notifications,webhooks,routes}, test/
 packages/web           src/{sync,store,components,pages,lib}
@@ -19,9 +19,9 @@ scripts/               dev.sh (one-command bring-up), build-prompt/gen.py (regen
 | Package | npm name | Depends on | Runs in |
 |---|---|---|---|
 | `packages/core` | `@pm/core` | zod | browser, Node, MCP (pure, no I/O) |
-| `packages/db` | `@pm/db` | `node:sqlite` (built into Node 22.13+) | Node (runtime layer, migrate / seed / reset) |
+| `packages/db` | `@pm/db` | postgres | Node (migrate / seed) |
 | `packages/integrations` | `@pm/integrations` | `@pm/core`, fastify types, nodemailer | inside `@pm/api` |
-| `packages/api` | `@pm/api` | `@pm/core`, `@pm/db`, `@pm/integrations`, fastify | the server |
+| `packages/api` | `@pm/api` | `@pm/core`, `@pm/integrations`, postgres, fastify | the server |
 | `packages/web` | `@pm/web` | `@pm/core`, replicache, react | browser |
 | `packages/mcp` | `@pm/mcp` | `@pm/core`, MCP SDK | agent host |
 
@@ -32,20 +32,16 @@ Conventions: ESM (`"type": "module"`), TypeScript `NodeNext`, imports inside a p
 ```bash
 pnpm install
 pnpm --filter @pm/core build         # first, always: other packages import @pm/core from its dist
-pnpm db:migrate                      # pnpm --filter @pm/db migrate; creates ./data/pmtool.db on first run
+pnpm db:migrate                      # pnpm --filter @pm/db migrate
 pnpm db:seed                         # no-op if any user exists; --force wipes and reseeds
-pnpm db:reset -- --yes               # delete the local database file, migrate, seed
+pnpm db:reset -- --yes               # drop schema, migrate, seed (local databases only)
 pnpm dev                             # API (:3001) and web (:5173) in parallel
 pnpm dev:api | pnpm dev:web | pnpm dev:mcp
 pnpm -r build | pnpm -r typecheck | pnpm -r test | pnpm -r lint
 python3 scripts/build-prompt/gen.py  # regenerate docs/BUILD-PROMPT.md
 ```
 
-Per package: `pnpm --filter @pm/<name> <build|typecheck|test|dev>`. The database is the SQLite file at `DATABASE_URL` (default `./data/pmtool.db`, relative to the repo root; `:memory:` also works); `pnpm db:migrate` creates it. There is nothing to start and nothing to install beyond Node and pnpm.
-
-### The `@pm/db` runtime
-
-`packages/db/src/sqlite.ts` is the one database layer every package uses: `openDb(path)` opens the file with `journal_mode = WAL`, `foreign_keys = ON`, `busy_timeout = 5000`, `synchronous = NORMAL` and registers `now()`, `uuid()` and `today()` helpers; the tagged `sql` template binds positional `?` parameters (`${sql(list)}` expands to an IN list, `sql.raw()` splices identifiers, nested fragments carry their params); result rows are hydrated by column name (JSON columns parsed, 0/1 booleans to `true`/`false`; extend with `registerJsonColumns`/`registerBooleanColumns` for new aliases); `sql.begin()` runs `BEGIN IMMEDIATE` behind an async mutex (nested calls become savepoints), `sql.snapshot()` a deferred read transaction; `nextVersion()`/`currentVersion()` touch `sync_state`; `sqliteErrorKind(e)` classifies `unique` / `check` / `foreign_key` / `not_null` / `trigger` / `busy`. `resolveDbPath()` turns `DATABASE_URL` into an absolute path.
+Per package: `pnpm --filter @pm/<name> <build|typecheck|test|dev>`. Local Postgres: `podman compose up -d postgres` (uses `compose.yml`), or any Postgres 15+ at `DATABASE_URL`.
 
 ### Build order
 
@@ -60,13 +56,13 @@ Per package: `pnpm --filter @pm/<name> <build|typecheck|test|dev>`. The database
 | `@pm/integrations` | 25 | `src/__tests__/{slack,github,email,verify,render,keys,routes}.test.ts` | Slack commands and events, GitHub payloads and key conventions, inbound email routing, signature verification, notification rendering, key extraction, route mounting |
 | `@pm/web` | 14 | `src/test/{shortcuts,mutators,filter,palette}.test.ts` | the shortcut registry, optimistic mutators mirroring the server, filter builder round-trips, palette ranking and actions |
 | `@pm/mcp` | 9 | `src/tools.test.ts`, `src/client.test.ts` | tool handlers against a stubbed API, the fetch wrapper and error mapping |
-| `@pm/db` | 7 | `src/migrate.test.ts` | migrations applied twice, seed twice, adopting a schema created out of band with `sqlite3`, full reset |
+| `@pm/db` | 7 | `src/migrate.test.ts` | migrations applied twice, seed twice, adopting a schema created with `psql`, full reset |
 
 ### The parity test
 
-`packages/core/src/query/parity.test.ts` loads one fixture set into an in-memory SQLite database (`openDb(':memory:')` plus `0001_init.sql`) **and** into plain objects, then asserts that `compileQuery` (executed as SQL) and `runSpec` return the same ids for every spec in the fixture: every op, null edge cases, macros, `fields.<key>` via `json_extract`, labels, `parent_id`, `is_blocked`. Nothing external is needed; `@pm/core` itself stays browser-safe because only the test imports `@pm/db`.
+`packages/core/src/query/parity.test.ts` loads one fixture set into a Postgres database **and** into memory, then asserts that `compileQuery` (executed as SQL) and `runSpec` return the same ids for every spec in the fixture: every op, null edge cases, macros, `fields.<key>` casts, labels, `parent_id`, `is_blocked`. It needs a database with the migration applied; CI creates `pmtool_core_test` from `0001_init.sql`. Locally, create one the same way or the SQL side is skipped.
 
-`@pm/db` and `@pm/api` tests open their own temporary databases (`:memory:` or a file under the OS temp directory) and apply the migration; nothing has to be running.
+`@pm/db` and `@pm/api` tests also need a reachable Postgres at `DATABASE_URL`; they create their own test databases.
 
 ## Conventions (rules of the road)
 
@@ -76,23 +72,21 @@ Per package: `pnpm --filter @pm/<name> <build|typecheck|test|dev>`. The database
 - **Rows are snake_case end to end**: SQL → API JSON → client store. No camelCase translation layer; sync is a straight copy.
 - **`QuerySpec` is the only query language.** To add a field or op, change `spec.ts`, implement it in both `compile.ts` (SQL) and `evaluate.ts` (client), and extend the parity fixture.
 - **Keep `@pm/core` browser-safe**: no `node:` imports, no DB driver in `dependencies`.
-- **Booleans are 0/1 and JSON is text in SQL.** Write them that way in queries and let the `@pm/db` runtime hydrate rows (it parses JSON columns and turns 0/1 into `true`/`false` by column name); never hand-parse in route code.
-- **Never hold a write transaction across network I/O.** SQLite has one writer; `sql.begin()` holds the lock until commit. Claim work in one short transaction, do the HTTP/SMTP call outside it, record the result in another.
 - **Ids are client-generated UUIDs** (`crypto.randomUUID()`) so optimistic UI is stable; keys like `RATES-12` are assigned by the database.
 - **State changes only through `transitionItem`**; `ItemPatch` has no `state_id`.
 - **Source of truth order when documents disagree**: the SQL migration and the core contract files (`schema/entities.ts`, `query/spec.ts`, `mutations.ts`, `workflow/types.ts`, `permissions/types.ts`, `integrations/src/deps.ts`), then `ARCHITECTURE.md`, then the numbered docs.
 
 ## CI
 
-[`.github/workflows/ci.yml`](https://github.com/jamjorf/pm-tool/blob/main/.github/workflows/ci.yml) runs on pushes to `main` and on pull requests: Node 22 with pnpm from `packageManager`, `pnpm install --frozen-lockfile`, `pnpm --filter @pm/core build`, `pnpm -r --filter './packages/*' build`, `pnpm db:migrate`, `pnpm db:seed`, then `pnpm -r --filter './packages/*' test`. There is no database service; `DATABASE_URL=./data/pmtool.db` and `APP_SECRET` are set as job env and the tests use in-memory or temporary files.
+[`.github/workflows/ci.yml`](https://github.com/jamjorf/pm-tool/blob/main/.github/workflows/ci.yml) runs on pushes to `main` and on pull requests: a Postgres 16 service, `pnpm install --frozen-lockfile`, `pnpm --filter @pm/core build`, `pnpm -r --filter './packages/*' build`, `pnpm db:migrate`, `pnpm db:seed`, creation of `pmtool_core_test` from `0001_init.sql` for the parity tests, then `pnpm -r --filter './packages/*' test`. `APP_SECRET` and `DATABASE_URL` are set as job env.
 
 [`.github/workflows/wiki.yml`](https://github.com/jamjorf/pm-tool/blob/main/.github/workflows/wiki.yml) publishes the `wiki/` directory to the repository's GitHub Wiki on every push to `main` that touches it. The wiki must be enabled and have one page created in the web UI before the first sync can push.
 
 ## Adding a migration
 
 1. Create `packages/db/migrations/0002_short_description.sql` (four-digit prefix, snake_case; the runner matches `^\d+_[\w-]+\.sql$`).
-2. Write plain, transactional DDL/DML for SQLite. The whole file runs in one `BEGIN IMMEDIATE` transaction via `tx.exec()`; SQLite DDL is transactional, so a failure rolls everything back. Remember what SQLite cannot do: no `alter table … alter column` or CHECK changes (rebuild the table: create new, copy, drop, rename, recreate indexes and triggers), `alter view` does not exist (`drop view` + `create view`), and `PRAGMA foreign_keys` is on.
-3. New synced tables need `version integer not null default 0`, `created_at`, `updated_at`, `deleted_at` and the two triggers copied from an existing table (`<table>_version_ins` after insert; `<table>_version_upd` after update `when new.version = old.version`), plus an entry in `SYNCED_TABLES` in `@pm/core` and visibility rules in the sync pull. Booleans are `integer … check (x in (0,1))`, JSON is `text … check (json_valid(x))`; add new JSON/boolean column names to `JSON_COLUMNS`/`BOOLEAN_COLUMNS` in `sqlite.ts` if the `is_` prefix or the existing list does not cover them.
+2. Write plain, transactional DDL/DML. The whole file runs in one transaction, so avoid statements that cannot (`create index concurrently`).
+3. New synced tables need `version bigint not null default 0`, `created_at`, `updated_at`, `deleted_at` and `select install_sync_trigger('<table>');`, plus an entry in `SYNCED_TABLES` in `@pm/core` and visibility rules in the sync pull.
 4. Never edit a migration that has shipped; add a new one.
 5. Run `pnpm db:migrate` (idempotent) and `pnpm --filter @pm/db test`.
 6. Regenerate the build prompt (below) because it embeds the SQL.

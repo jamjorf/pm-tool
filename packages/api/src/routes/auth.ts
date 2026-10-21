@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { createApiKey } from '../auth/apikeys.js';
@@ -7,9 +8,8 @@ import { createSession, destroySession, SESSION_COOKIE } from '../auth/session.j
 import { findOrCreateUser } from '../auth/users.js';
 import { forbidden, notFound } from '../errors.js';
 import { parse, paramsOf, queryOf } from './util.js';
-import { setOf, withTxn } from '../db.js';
+import { withTxn } from '../db.js';
 import { writeEvents } from '../activity.js';
-import { reload } from '../mutations/helpers.js';
 
 export async function authRoutes(app: FastifyInstance) {
   const cookieOpts = () => ({
@@ -70,11 +70,11 @@ export async function authRoutes(app: FastifyInstance) {
       const updates: Record<string, unknown> = {};
       if (body.name !== undefined) updates.name = body.name;
       if (body.avatar_url !== undefined) updates.avatar_url = body.avatar_url;
-      if (body.settings !== undefined) updates.settings = tx.json({ ...user.settings, ...body.settings });
+      if (body.settings !== undefined) updates.settings = tx.json({ ...user.settings, ...body.settings } as any);
       if (!Object.keys(updates).length) return user;
-      await tx`update users set ${setOf(tx, updates)} where id = ${user.id}`;
+      const [u] = await tx`update users set ${tx(updates as any)} where id = ${user.id} returning *`;
       await writeEvents(tx, request.actor, app.metaFor(request, 'updateUser'), [{ entity_type: 'user', entity_id: user.id, action: 'update', field: null, new_value: Object.keys(updates) }]);
-      return reload(tx, 'users', user.id);
+      return u!;
     });
     return { user: updated };
   });
@@ -99,4 +99,6 @@ export async function authRoutes(app: FastifyInstance) {
     if (!rows.length) throw notFound('api key not found');
     return { ok: true };
   });
+
+  void randomUUID;
 }

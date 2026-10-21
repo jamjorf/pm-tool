@@ -1,4 +1,4 @@
-import { nowIso, type Q } from '../db.js';
+import type { Q } from '../db.js';
 import { randomToken, sha256 } from './tokens.js';
 
 export const SESSION_COOKIE = 'pm_session';
@@ -12,10 +12,9 @@ export async function createSession(q: Q, userId: string, ttlDays: number): Prom
 
 /** Resolve a raw session token to a user id (null if unknown/expired). */
 export async function resolveSession(q: Q, token: string): Promise<string | null> {
-  const now = nowIso();
   const [s] = await q`
-    update sessions set last_seen_at = ${now}
-    where token_hash = ${sha256(token)} and expires_at > ${now}
+    update sessions set last_seen_at = now()
+    where token_hash = ${sha256(token)} and expires_at > now()
     returning user_id`;
   return s?.user_id ?? null;
 }

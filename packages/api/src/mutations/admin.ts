@@ -1,9 +1,9 @@
 import type { MutationArgsOf, WorkflowDefinition, WorkflowState, WorkflowTransition } from '@pm/core';
-import { nowIso, type Row } from '../db.js';
+import type { Row } from '../db.js';
 import { notFound, validation } from '../errors.js';
 import { workflowEngine } from '../core-compat.js';
 import type { MutationCtx } from './context.js';
-import { assertCan, getWorkflowDef, reload } from './helpers.js';
+import { assertCan, getWorkflowDef } from './helpers.js';
 
 export async function upsertItemType(ctx: MutationCtx, args: MutationArgsOf<'upsertItemType'>): Promise<Row> {
   const { tx, actor, meta } = ctx;
@@ -16,41 +16,33 @@ export async function upsertItemType(ctx: MutationCtx, args: MutationArgsOf<'ups
     const oldKeys = (existing.field_defs as { key: string }[]).map((d) => d.key);
     const newKeys = new Set(args.field_defs.map((d) => d.key));
     const removed = oldKeys.filter((k) => !newKeys.has(k));
-    // `fields ?| keys` → any of the removed keys present in the JSON object
-    const usesRemoved = tx`exists (select 1 from json_each(work_items.fields) jk where jk.key in ${tx(removed)})`;
     if (removed.length) {
-      const n = Number((await tx`select count(*) as n from work_items where type_id = ${existing.id} and deleted_at is null and ${usesRemoved}`)[0]!.n);
+      const n = (await tx`select count(*)::int as n from work_items where type_id = ${existing.id} and deleted_at is null and fields ?| ${removed}::text[]`)[0]!.n as number;
       if (n > 0 && !meta.force) {
         throw validation(`field keys still used by ${n} item(s): ${removed.join(', ')} (pass ?force=1 to drop them)`, { fields: removed, items: n });
       }
     }
     if (existing.workflow_id !== args.workflow_id) {
-      const n = Number((await tx`select count(*) as n from work_items where type_id = ${existing.id} and deleted_at is null`)[0]!.n);
+      const n = (await tx`select count(*)::int as n from work_items where type_id = ${existing.id} and deleted_at is null`)[0]!.n as number;
       if (n > 0 && !meta.force) throw validation(`cannot change the workflow of a type with ${n} item(s) (pass ?force=1 to remap states)`, { items: n });
     }
-    await tx`
+    const [after] = await tx`
       update item_types set name = ${args.name}, plural_name = ${args.plural_name ?? null}, icon = ${args.icon ?? null}, color = ${args.color ?? null},
-        description = ${args.description ?? null}, workflow_id = ${args.workflow_id}, field_defs = ${tx.json(args.field_defs)},
+        description = ${args.description ?? null}, workflow_id = ${args.workflow_id}, field_defs = ${tx.json(args.field_defs as any)},
         is_container = ${args.is_container ?? existing.is_container}, sort = ${args.sort ?? existing.sort}, is_active = ${args.is_active ?? existing.is_active}, deleted_at = null
-      where id = ${existing.id}`;
+      where id = ${existing.id} returning *`;
     if (existing.workflow_id !== args.workflow_id) await remapItemStates(ctx, existing.id, args.workflow_id);
-    if (removed.length) {
-      // `fields - keys` → json_remove(fields, '$.k1', '$.k2', ...); keys are validated by FieldDef (^[a-z][a-z0-9_]*$)
-      const paths = removed.map((k) => `$.${k}`);
-      const pathArgs = tx.unsafe(paths.map(() => '?').join(', '), paths);
-      await tx`update work_items set fields = json_remove(fields, ${pathArgs}) where type_id = ${existing.id} and ${usesRemoved}`;
-    }
-    const after = await reload(tx, 'item_types', existing.id);
+    if (removed.length) await tx`update work_items set fields = fields - ${removed}::text[] where type_id = ${existing.id} and fields ?| ${removed}::text[]`;
     await ctx.emit([{ entity_type: 'item_type', entity_id: existing.id, action: 'update', field: null, old_value: existing, new_value: after }]);
-    return after;
+    return after!;
   }
-  await tx`
+  const [created] = await tx`
     insert into item_types (id, key, name, plural_name, icon, color, description, workflow_id, field_defs, is_container, sort, is_active)
     values (${args.id}, ${args.key}, ${args.name}, ${args.plural_name ?? null}, ${args.icon ?? null}, ${args.color ?? null}, ${args.description ?? null},
-            ${args.workflow_id}, ${tx.json(args.field_defs)}, ${args.is_container ?? false}, ${args.sort ?? 0}, ${args.is_active ?? true})`;
-  const created = await reload(tx, 'item_types', args.id);
-  await ctx.emit([{ entity_type: 'item_type', entity_id: created.id, action: 'create', field: null, new_value: created }]);
-  return created;
+            ${args.workflow_id}, ${tx.json(args.field_defs as any)}, ${args.is_container ?? false}, ${args.sort ?? 0}, ${args.is_active ?? true})
+    returning *`;
+  await ctx.emit([{ entity_type: 'item_type', entity_id: created!.id, action: 'create', field: null, new_value: created }]);
+  return created!;
 }
 
 /** Move items of a type to the same-key state in the new workflow (or its initial state). */
@@ -98,13 +90,13 @@ export async function upsertWorkflow(ctx: MutationCtx, args: MutationArgsOf<'ups
   }
   for (const d of dbStates) {
     if (kept.has(d.id) || d.deleted_at) continue;
-    const n = Number((await tx`select count(*) as n from work_items where state_id = ${d.id} and deleted_at is null`)[0]!.n);
+    const n = (await tx`select count(*)::int as n from work_items where state_id = ${d.id} and deleted_at is null`)[0]!.n as number;
     if (n > 0) throw validation(`state "${d.key}" is still used by ${n} item(s) and cannot be removed`, { state: d.key, items: n });
   }
   const initialIncoming = args.states.find((s) => s.is_initial)!;
-  await tx`update workflow_states set is_initial = 0 where workflow_id = ${wfId} and is_initial = 1 and id <> ${stateId.get(initialIncoming.id)!}`;
+  await tx`update workflow_states set is_initial = false where workflow_id = ${wfId} and is_initial and id <> ${stateId.get(initialIncoming.id)!}`;
   for (const d of dbStates) {
-    if (!kept.has(d.id) && !d.deleted_at) await tx`update workflow_states set deleted_at = ${nowIso()}, is_initial = 0 where id = ${d.id}`;
+    if (!kept.has(d.id) && !d.deleted_at) await tx`update workflow_states set deleted_at = now(), is_initial = false where id = ${d.id}`;
   }
   for (const s of args.states) {
     const rid = stateId.get(s.id)!;
@@ -126,13 +118,13 @@ export async function upsertWorkflow(ctx: MutationCtx, args: MutationArgsOf<'ups
     resolvedT.push({ incoming: t, id });
   }
   for (const d of dbTransitions) {
-    if (!keptT.has(d.id) && !d.deleted_at) await tx`update workflow_transitions set deleted_at = ${nowIso()} where id = ${d.id}`;
+    if (!keptT.has(d.id) && !d.deleted_at) await tx`update workflow_transitions set deleted_at = now() where id = ${d.id}`;
   }
   for (const { incoming: t, id } of resolvedT) {
     await tx`
       insert into workflow_transitions (id, workflow_id, key, name, from_state_id, to_state_id, guards, effects, sort)
       values (${id}, ${wfId}, ${t.key}, ${t.name}, ${t.from_state_id ? stateId.get(t.from_state_id) ?? t.from_state_id : null}, ${stateId.get(t.to_state_id) ?? t.to_state_id},
-              ${tx.json(t.guards)}, ${tx.json(t.effects)}, ${t.sort})
+              ${tx.json(t.guards as any)}, ${tx.json(t.effects as any)}, ${t.sort})
       on conflict (id) do update set key = excluded.key, name = excluded.name, from_state_id = excluded.from_state_id, to_state_id = excluded.to_state_id,
         guards = excluded.guards, effects = excluded.effects, sort = excluded.sort, deleted_at = null`;
   }

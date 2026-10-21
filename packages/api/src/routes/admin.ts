@@ -3,10 +3,10 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { EVENT_KINDS, FieldDef, FirmRole, Guard, Effect, StateCategory } from '@pm/core';
 import { requireAuth, requireFirmAdmin } from '../auth/plugin.js';
-import { isUuid, nowIso, setOf, withTxn } from '../db.js';
+import { isUuid, withTxn } from '../db.js';
 import { notFound, validation } from '../errors.js';
 import { writeEvents } from '../activity.js';
-import { getWorkflowDef, reload, resolveProjectId, visibleProjects } from '../mutations/helpers.js';
+import { getWorkflowDef, resolveProjectId } from '../mutations/helpers.js';
 import { sendWebhook } from '../webhooks/dispatcher.js';
 import { actorOf, flag, intQuery, parse, paramsOf, projectIdQuery, queryOf, zUuid } from './util.js';
 
@@ -99,8 +99,8 @@ export async function adminRoutes(app: FastifyInstance) {
     const projectId = await projectIdQuery(db, request);
     const labels = await db`
       select * from labels where deleted_at is null
-        and (project_id is null or project_id in ${visibleProjects(db, actor.id)})
-        and (${projectId} is null or project_id is null or project_id = ${projectId})
+        and (project_id is null or project_id in (select visible_project_ids(${actor.id})))
+        and (${projectId}::uuid is null or project_id is null or project_id = ${projectId}::uuid)
       order by project_id nulls first, name`;
     return { labels };
   });
@@ -129,12 +129,11 @@ export async function adminRoutes(app: FastifyInstance) {
       const updates: Record<string, unknown> = {};
       for (const k of ['firm_role', 'is_active', 'name'] as const) if (body[k] !== undefined) updates[k] = body[k];
       if (!Object.keys(updates).length) return before;
-      await tx`update users set ${setOf(tx, updates)} where id = ${id}`;
-      const after = await reload(tx, 'users', id);
+      const [after] = await tx`update users set ${tx(updates as any)} where id = ${id} returning *`;
       const meta = app.metaFor(request, 'updateUser');
-      await writeEvents(tx, request.actor, meta, Object.keys(updates).map((k) => ({ entity_type: 'user', entity_id: id, action: 'update', field: k, old_value: before[k], new_value: after[k] })));
-      if (updates.firm_role !== undefined || updates.is_active !== undefined) await tx`update sync_client_groups set resync_required = 1 where user_id = ${id}`;
-      return after;
+      await writeEvents(tx, request.actor, meta, Object.keys(updates).map((k) => ({ entity_type: 'user', entity_id: id, action: 'update', field: k, old_value: before[k], new_value: after![k] })));
+      if (updates.firm_role !== undefined || updates.is_active !== undefined) await tx`update sync_client_groups set resync_required = true where user_id = ${id}`;
+      return after!;
     });
     return { user };
   });
@@ -152,12 +151,11 @@ export async function adminRoutes(app: FastifyInstance) {
     const kind = paramsOf(request).kind!;
     if (!['slack', 'github', 'email'].includes(kind)) throw validation('kind must be slack, github or email');
     const body = parse(z.object({ config: z.record(z.unknown()).optional(), is_active: z.boolean().optional() }), request.body);
-    // In DO UPDATE, unqualified columns are the existing row's values.
     const [row] = await db`
       insert into integration_configs (kind, config, is_active, updated_by, updated_at)
-      values (${kind}, ${db.json(body.config ?? {})}, ${body.is_active ?? false}, ${actorOf(request).id}, ${nowIso()})
-      on conflict (kind) do update set config = coalesce(${body.config ? db.json(body.config) : null}, config),
-        is_active = coalesce(${body.is_active ?? null}, is_active), updated_by = excluded.updated_by, updated_at = excluded.updated_at
+      values (${kind}, ${db.json((body.config ?? {}) as any)}, ${body.is_active ?? false}, ${actorOf(request).id}, now())
+      on conflict (kind) do update set config = coalesce(${body.config ? db.json(body.config as any) : null}, integration_configs.config),
+        is_active = coalesce(${body.is_active ?? null}, integration_configs.is_active), updated_by = excluded.updated_by, updated_at = now()
       returning *`;
     if (app.refreshIntegrations) await app.refreshIntegrations();
     return row;
@@ -184,12 +182,12 @@ export async function adminRoutes(app: FastifyInstance) {
     const kinds = body.event_kinds ?? ['*'];
     checkKinds(kinds);
     const project_id = body.project_id ?? (body.project ? await resolveProjectId(db, body.project) : null);
-    const id = randomUUID();
-    await db`
-      insert into webhook_endpoints (id, name, url, secret, event_kinds, project_id, is_active, created_by)
-      values (${id}, ${body.name}, ${body.url}, ${body.secret ?? randomBytes(32).toString('hex')}, ${kinds}, ${project_id}, ${body.is_active ?? true}, ${actorOf(request).id})`;
+    const [row] = await db`
+      insert into webhook_endpoints (name, url, secret, event_kinds, project_id, is_active, created_by)
+      values (${body.name}, ${body.url}, ${body.secret ?? randomBytes(32).toString('hex')}, ${kinds}, ${project_id}, ${body.is_active ?? true}, ${actorOf(request).id})
+      returning *`;
     reply.code(201);
-    return reload(db, 'webhook_endpoints', id);
+    return row;
   });
 
   app.patch('/webhooks/:id', async (request) => {
@@ -202,15 +200,14 @@ export async function adminRoutes(app: FastifyInstance) {
     else if (body.project !== undefined) updates.project_id = body.project ? await resolveProjectId(db, body.project) : null;
     if (!Object.keys(updates).length) throw validation('nothing to update');
     updates.updated_at = new Date().toISOString();
-    const id = paramsOf(request).id!;
-    const res = await db`update webhook_endpoints set ${setOf(db, updates)} where id = ${id} and deleted_at is null returning id`;
-    if (!res.length) throw notFound('webhook not found');
-    return reload(db, 'webhook_endpoints', id);
+    const [row] = await db`update webhook_endpoints set ${db(updates as any)} where id = ${paramsOf(request).id!} and deleted_at is null returning *`;
+    if (!row) throw notFound('webhook not found');
+    return row;
   });
 
   app.delete('/webhooks/:id', async (request) => {
     requireFirmAdmin(request);
-    const rows = await db`update webhook_endpoints set deleted_at = ${nowIso()}, is_active = 0 where id = ${paramsOf(request).id!} and deleted_at is null returning id`;
+    const rows = await db`update webhook_endpoints set deleted_at = now(), is_active = false where id = ${paramsOf(request).id!} and deleted_at is null returning id`;
     if (!rows.length) throw notFound('webhook not found');
     return { ok: true };
   });
@@ -219,7 +216,7 @@ export async function adminRoutes(app: FastifyInstance) {
     requireFirmAdmin(request);
     const limit = intQuery(queryOf(request).limit, 50, 500);
     const deliveries = await db`
-      select id, endpoint_id, event_id, event_kind, status, attempts, next_attempt_at, last_attempt_at, response_status, substr(response_body, 1, 2000) as response_body, created_at, payload
+      select id, endpoint_id, event_id, event_kind, status, attempts, next_attempt_at, last_attempt_at, response_status, left(response_body, 2000) as response_body, created_at, payload
       from webhook_deliveries where endpoint_id = ${paramsOf(request).id!} order by id desc limit ${limit}`;
     return { deliveries };
   });

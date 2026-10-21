@@ -3,26 +3,13 @@
 //   pnpm --filter @pm/db seed [--force]
 // Idempotent: skips when any user exists unless --force (which wipes data
 // tables first, including the append-only activity log, by temporarily
-// dropping its guard triggers — development only). Everything runs in ONE
-// transaction (BEGIN IMMEDIATE), so a failure leaves the database untouched.
-//
-// SQLite notes
-//   * every id is generated here (crypto.randomUUID) and inserted explicitly;
-//   * work_items.number/key are inserted explicitly too (deterministic per
-//     project, DFS order) and projects.item_seq is set to the item count, so
-//     the assign_item_number trigger stays idle and created_at/updated_at keep
-//     the back-dated values that make the history look real;
-//   * JSON columns take JS objects (auto-serialised), 0/1 columns take
-//     booleans, timestamps are ISO strings and dates YYYY-MM-DD;
-//   * scalar JSON values (activity old_value/new_value) go through tx.json().
+// disabling its guard triggers — development only).
 // ============================================================================
-import { randomUUID } from 'node:crypto';
-import { connect, databasePath, hasFlag, isMain } from './client.js';
-import type { Sql } from './sqlite.js';
+import type { TransactionSql } from 'postgres';
+import { connect, hasFlag, isMain, type Sql } from './client.js';
 
-const uuid = () => randomUUID();
+const uuid = () => crypto.randomUUID();
 const DAY = 86_400_000;
-const HOUR = 3_600_000;
 
 // ---------------------------------------------------------------------------
 // Static catalogue
@@ -38,10 +25,9 @@ export const SEED_USERS = [
   { key: 'hugo', email: 'hugo@firm.com', name: 'Hugo Schmidt', firm_role: 'member' },
   { key: 'agent', email: 'agent@firm.com', name: 'PM Agent', firm_role: 'member', is_service: true },
 ] as const;
-export type SeedUserKey = (typeof SEED_USERS)[number]['key'];
-type UserKey = SeedUserKey;
+type UserKey = (typeof SEED_USERS)[number]['key'];
 
-export const SEED_TEAMS = [
+const TEAMS = [
   { key: 'RATES', name: 'Rates Technology', description: 'Pricing, risk and booking for the rates desk', members: ['carol', 'dan', 'eve'] as UserKey[], lead: 'carol' as UserKey },
   { key: 'EQD', name: 'Equity Derivatives Technology', description: 'Exotics pricing and hedging tools', members: ['dan', 'frank', 'eve'] as UserKey[], lead: 'dan' as UserKey },
   { key: 'OPS', name: 'Operations', description: 'Settlements, onboarding and controls', members: ['grace', 'hugo', 'frank'] as UserKey[], lead: 'grace' as UserKey },
@@ -49,14 +35,8 @@ export const SEED_TEAMS = [
 
 const FIRM_LABELS = ['regulatory', 'tech-debt', 'quick-win'];
 
-const LABEL_COLORS: Record<string, string> = {
-  regulatory: '#ef4444', 'tech-debt': '#f59e0b', 'quick-win': '#10b981', sofr: '#6366f1', pricing: '#8b5cf6', vol: '#ec4899', greeks: '#14b8a6', kyc: '#f97316', runbook: '#64748b',
-};
-
-export type SeedTypeKey = 'task' | 'bug' | 'initiative' | 'request';
-type TypeKey = SeedTypeKey;
-
-export interface ItemSeed {
+type TypeKey = 'task' | 'bug' | 'initiative' | 'request';
+interface ItemSeed {
   type: TypeKey;
   title: string;
   state: string;             // state key within the type's workflow
@@ -78,7 +58,7 @@ export interface ItemSeed {
   /** external GitHub PR link */
   pr?: { repo: string; number: number; title: string };
 }
-export interface ProjectSeed {
+interface ProjectSeed {
   key: string; name: string; description: string; visibility: 'firm' | 'private'; lead: UserKey; team: string;
   members?: { user: UserKey; role: 'admin' | 'editor' | 'viewer' }[];
   labels: string[];
@@ -206,9 +186,6 @@ export const SEED_PROJECTS: ProjectSeed[] = [
   },
 ];
 
-/** Number of items a project seed inserts (initiatives + their children + stand-alone items). */
-export const countSeedItems = (items: readonly ItemSeed[]): number => items.reduce((n, s) => n + 1 + countSeedItems(s.children ?? []), 0);
-
 // ---------------------------------------------------------------------------
 // Seeding
 // ---------------------------------------------------------------------------
@@ -219,77 +196,36 @@ export interface SeedSummary {
 }
 
 export interface SeedOptions {
-  /** Wipe every data table first (development only). */
   force?: boolean;
-  /** "Today" for relative dates; defaults to the wall clock. */
   now?: Date;
   log?: (message: string) => void;
 }
 
-const iso = (d: Date) => d.toISOString();
 const ymd = (d: Date) => d.toISOString().slice(0, 10);
 const daysFrom = (now: Date, n: number) => ymd(new Date(now.getTime() + n * DAY));
 
-/** The two guard triggers exactly as 0001_init.sql creates them (recreated after a --force wipe). */
-const ACTIVITY_GUARD_TRIGGERS = `
-create trigger activity_events_no_update before update on activity_events begin
-  select raise(abort, 'activity_events is append-only (UPDATE denied)');
-end;
-create trigger activity_events_no_delete before delete on activity_events begin
-  select raise(abort, 'activity_events is append-only (DELETE denied)');
-end;`;
-
-/**
- * Wipe every data table (dev only), children first because foreign_keys is ON
- * and several edges have no ON DELETE CASCADE. Reference data stays: workflows,
- * states, transitions, item types, relation types, settings, sync_state and
- * schema_migrations. activity_events is append-only, so its guard triggers are
- * dropped for the delete and recreated verbatim. Deleting projects also resets
- * their item_seq (the counter lives on the row).
- */
-function wipe(tx: Sql): void {
-  tx.exec(`
-    drop trigger if exists activity_events_no_update;
-    drop trigger if exists activity_events_no_delete;
-    delete from webhook_deliveries;
-    delete from notifications;
-    delete from notification_deliveries;
-    delete from activity_events;
-    ${ACTIVITY_GUARD_TRIGGERS}
-    delete from inbound_events;
-    delete from sync_clients;
-    delete from sync_client_groups;
-    delete from sessions;
-    delete from api_keys;
-    delete from item_watchers;
-    delete from notification_preferences;
-    delete from comments;
-    delete from attachments;
-    delete from work_item_labels;
-    delete from relations;
-    delete from work_items;
-    delete from labels;
-    delete from views;
-    delete from webhook_endpoints;
-    delete from integration_configs;
-    delete from project_members;
-    delete from projects;
-    delete from team_members;
-    delete from teams;
-    delete from users;
+/** Wipe every data table (dev only). activity_events is append-only, so its guard triggers are disabled for the truncate. */
+async function wipe(tx: TransactionSql): Promise<void> {
+  await tx.unsafe(`
+    alter table activity_events disable trigger activity_events_append_only;
+    alter table activity_events disable trigger activity_events_no_truncate;
+    truncate activity_events, webhook_deliveries, notification_deliveries, inbound_events, sync_clients, sync_client_groups cascade;
+    alter table activity_events enable trigger activity_events_append_only;
+    alter table activity_events enable trigger activity_events_no_truncate;
+    truncate users, teams, projects, labels, views, webhook_endpoints, integration_configs cascade;
   `);
 }
 
 export async function seed(sql: Sql, opts: SeedOptions = {}): Promise<SeedSummary | null> {
   const log = opts.log ?? (() => undefined);
   const now = opts.now ?? new Date();
-  const origin = new Date(now.getTime() - 120 * DAY); // when the firm "started using" the tool
   return sql.begin(async (tx) => {
-    const [row] = await tx<{ n: number }>`select count(*) as n from users`;
-    const n = Number(row?.n ?? 0);
+    await tx`select pg_advisory_xact_lock(42)`;
+    const [row] = await tx<{ n: number }[]>`select count(*)::int as n from users`;
+    const n = row?.n ?? 0;
     if (n > 0) {
       if (!opts.force) { log(`seed: ${n} users already present; skipping (use --force to reseed)`); return null; }
-      wipe(tx);
+      await wipe(tx);
       log('seed: existing data wiped (--force)');
     }
 
@@ -297,132 +233,116 @@ export async function seed(sql: Sql, opts: SeedOptions = {}): Promise<SeedSummar
     const users: Record<UserKey, string> = {} as Record<UserKey, string>;
     for (const u of SEED_USERS) {
       users[u.key] = uuid();
-      await tx`insert into users (id, email, name, firm_role, is_service, avatar_url, created_at, updated_at) values
-        (${users[u.key]}, ${u.email}, ${u.name}, ${u.firm_role}, ${'is_service' in u && u.is_service}, ${`https://api.dicebear.com/9.x/initials/svg?seed=${encodeURIComponent(u.name)}`},
-         ${iso(origin)}, ${iso(origin)})`;
+      await tx`insert into users (id, email, name, firm_role, is_service, avatar_url) values
+        (${users[u.key]}, ${u.email}, ${u.name}, ${u.firm_role}::text::firm_role, ${'is_service' in u && u.is_service}, ${`https://api.dicebear.com/9.x/initials/svg?seed=${encodeURIComponent(u.name)}`})`;
     }
 
     // --- teams ---------------------------------------------------------------
     const teams: Record<string, string> = {};
-    for (const t of SEED_TEAMS) {
+    for (const t of TEAMS) {
       teams[t.key] = uuid();
-      await tx`insert into teams (id, key, name, description, created_at, updated_at) values (${teams[t.key]!}, ${t.key}, ${t.name}, ${t.description}, ${iso(origin)}, ${iso(origin)})`;
-      for (const m of t.members) await tx`insert into team_members (team_id, user_id, is_lead, created_at) values (${teams[t.key]!}, ${users[m]}, ${m === t.lead}, ${iso(origin)})`;
+      await tx`insert into teams (id, key, name, description) values (${teams[t.key]!}, ${t.key}, ${t.name}, ${t.description})`;
+      for (const m of t.members) await tx`insert into team_members (team_id, user_id, is_lead) values (${teams[t.key]!}, ${users[m]}, ${m === t.lead})`;
     }
 
-    // --- workflows / types (reference data shipped by the migration) ---------
-    const types = await tx<{ id: string; key: TypeKey; workflow_id: string }>`select id, key, workflow_id from item_types where deleted_at is null`;
-    const states = await tx<{ id: string; workflow_id: string; key: string; category: string; is_initial: boolean }>`select id, workflow_id, key, category, is_initial from workflow_states where deleted_at is null`;
+    // --- workflows / types ---------------------------------------------------
+    const types = await tx<{ id: string; key: TypeKey; workflow_id: string }[]>`select id, key, workflow_id from item_types where deleted_at is null`;
+    const states = await tx<{ id: string; workflow_id: string; key: string; category: string; is_initial: boolean }[]>`select id, workflow_id, key, category, is_initial from workflow_states where deleted_at is null`;
     const typeByKey = Object.fromEntries(types.map((t) => [t.key, t])) as Record<TypeKey, (typeof types)[number]>;
-    for (const k of ['task', 'bug', 'initiative', 'request'] as TypeKey[]) if (!typeByKey[k]) throw new Error(`seed: item type "${k}" missing; run the migrations first`);
     const stateOf = (type: TypeKey, key: string) => {
       const s = states.find((x) => x.workflow_id === typeByKey[type].workflow_id && x.key === key);
       if (!s) throw new Error(`seed: no state "${key}" in workflow of type ${type}`);
       return s;
     };
-    const initialOf = (type: TypeKey) => {
-      const s = states.find((x) => x.workflow_id === typeByKey[type].workflow_id && x.is_initial);
-      if (!s) throw new Error(`seed: workflow of type ${type} has no initial state`);
-      return s;
-    };
+    const initialOf = (type: TypeKey) => states.find((x) => x.workflow_id === typeByKey[type].workflow_id && x.is_initial)!;
 
     // --- labels --------------------------------------------------------------
     const firmLabels: Record<string, string> = {};
     for (const name of FIRM_LABELS) {
       firmLabels[name] = uuid();
-      await tx`insert into labels (id, project_id, name, color, created_at, updated_at) values (${firmLabels[name]!}, null, ${name}, ${LABEL_COLORS[name] ?? '#6b7280'}, ${iso(origin)}, ${iso(origin)})`;
+      await tx`insert into labels (id, project_id, name, color) values (${firmLabels[name]!}, null, ${name}, ${LABEL_COLORS[name] ?? '#6b7280'})`;
     }
     let labelCount = FIRM_LABELS.length;
 
     // --- projects + items ----------------------------------------------------
     const counts = { items: 0, relations: 0, comments: 0, watchers: 0, events: 0, views: 0 };
     const itemIdByTitle = new Map<string, string>();
-    type Inserted = { id: string; key: string; number: number; title: string; type: TypeKey; project: string; projectKey: string; seed: ItemSeed; reporter: UserKey; assignee: UserKey | null; createdAt: Date; stateId: string; stateKey: string; category: string; completedAt: Date | null };
+    type Inserted = { id: string; key: string; title: string; type: TypeKey; project: string; projectKey: string; seed: ItemSeed; reporter: UserKey; assignee: UserKey | null; createdAt: Date; stateId: string; stateKey: string; category: string; completedAt: Date | null };
     const inserted: Inserted[] = [];
     const projectIds: Record<string, string> = {};
-    const projectLabels: Record<string, Record<string, string>> = {};
-    const numbering = new Map<string, number>(); // project key → last item number handed out
     let seq = 0;
 
     const insertItem = async (p: ProjectSeed, s: ItemSeed, parent: Inserted | null): Promise<Inserted> => {
       const i = seq++;
       const id = uuid();
-      const pid = projectIds[p.key]!;
       const type = typeByKey[s.type];
       const state = stateOf(s.type, s.state);
-      // Explicit per-project numbering (DFS order): see the header for why.
-      const number = (numbering.get(p.key) ?? 0) + 1;
-      numbering.set(p.key, number);
-      const key = `${p.key}-${number}`;
       const reporter: UserKey = s.reporter ?? (i % 3 === 0 ? 'alice' : i % 3 === 1 ? 'bob' : p.lead);
       const assignee = s.assignee === undefined ? p.lead : s.assignee;
-      const createdAt = new Date(now.getTime() - (5 + ((i * 7) % 55)) * DAY - (i % 24) * HOUR - i * 1000);
-      const updatedAt = new Date(Math.min(now.getTime() - (i % 5) * HOUR, createdAt.getTime() + ((i * 3) % 20 + 1) * DAY));
+      const createdAt = new Date(now.getTime() - (5 + ((i * 7) % 55)) * DAY - (i % 24) * 3_600_000 - i * 1000);
+      const updatedAt = new Date(Math.min(now.getTime() - (i % 5) * 3_600_000, createdAt.getTime() + ((i * 3) % 20 + 1) * DAY));
       const completedAt = state.category === 'done' ? new Date(Math.max(createdAt.getTime() + DAY, now.getTime() - ((i * 5) % 28) * DAY - i * 60_000)) : null;
       const canceledAt = state.category === 'canceled' ? new Date(now.getTime() - ((i * 4) % 14) * DAY) : null;
       const fields: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(s.fields ?? {})) if (v !== undefined) fields[k] = v;
       const description = s.description ?? (s.type === 'initiative' ? String((s.fields ?? {}).business_case ?? '') : '');
-      const estimate = s.estimate === undefined ? (s.type === 'initiative' ? null : 3) : s.estimate;
-      await tx`insert into work_items (id, project_id, type_id, number, key, title, description, state_id, priority, assignee_id, reporter_id, created_by,
+      await tx`insert into work_items (id, project_id, type_id, title, description, state_id, priority, assignee_id, reporter_id, created_by,
           start_date, due_date, estimate, fields, confidential, sort_order, created_at, updated_at, completed_at, canceled_at)
-        values (${id}, ${pid}, ${type.id}, ${number}, ${key}, ${s.title}, ${description}, ${state.id}, ${s.priority ?? 3},
+        values (${id}, ${projectIds[p.key]!}, ${type.id}, ${s.title}, ${description}, ${state.id}, ${s.priority ?? 3},
           ${assignee ? users[assignee] : null}, ${users[reporter]}, ${users[reporter]},
           ${s.start === undefined || s.start === null ? null : daysFrom(now, s.start)}, ${s.due === undefined || s.due === null ? null : daysFrom(now, s.due)},
-          ${estimate}, ${fields}, ${s.confidential ?? false}, ${(i * 37) % 11},
-          ${iso(createdAt)}, ${iso(updatedAt)}, ${completedAt ? iso(completedAt) : null}, ${canceledAt ? iso(canceledAt) : null})`;
-      const rec: Inserted = { id, key, number, title: s.title, type: s.type, project: pid, projectKey: p.key, seed: s, reporter, assignee, createdAt, stateId: state.id, stateKey: state.key, category: state.category, completedAt };
+          ${s.estimate === undefined ? (s.type === 'initiative' ? null : 3) : s.estimate}, ${tx.json(fields as never)}, ${s.confidential ?? false}, ${(i * 37) % 11},
+          ${createdAt}, ${updatedAt}, ${completedAt}, ${canceledAt})`;
+      const [row] = await tx<{ key: string }[]>`select key from work_items where id = ${id}`;
+      const rec: Inserted = { id, key: row!.key, title: s.title, type: s.type, project: projectIds[p.key]!, projectKey: p.key, seed: s, reporter, assignee, createdAt, stateId: state.id, stateKey: state.key, category: state.category, completedAt };
       inserted.push(rec);
-      if (itemIdByTitle.has(s.title)) throw new Error(`seed: duplicate item title "${s.title}"`);
       itemIdByTitle.set(s.title, id);
       counts.items++;
       for (const name of s.labels ?? []) {
         const labelId = firmLabels[name] ?? projectLabels[p.key]?.[name];
         if (!labelId) throw new Error(`seed: unknown label ${name} for ${p.key}`);
-        await tx`insert into work_item_labels (item_id, label_id, created_at, updated_at) values (${id}, ${labelId}, ${iso(createdAt)}, ${iso(createdAt)})`;
+        await tx`insert into work_item_labels (item_id, label_id) values (${id}, ${labelId})`;
       }
       if (parent) {
-        await tx`insert into relations (id, type, from_item_id, to_item_id, created_by, created_at, updated_at) values (${uuid()}, 'parent_of', ${parent.id}, ${id}, ${users[reporter]}, ${iso(createdAt)}, ${iso(createdAt)})`;
+        await tx`insert into relations (id, type, from_item_id, to_item_id, created_by) values (${uuid()}, 'parent_of', ${parent.id}, ${id}, ${users[reporter]})`;
         counts.relations++;
       }
       for (const c of s.children ?? []) await insertItem(p, c, rec);
       return rec;
     };
 
+    const projectLabels: Record<string, Record<string, string>> = {};
     for (const p of SEED_PROJECTS) {
       projectIds[p.key] = uuid();
-      const itemSeq = countSeedItems(p.items);
-      await tx`insert into projects (id, key, name, description, status, visibility, lead_id, team_id, item_seq, start_date, target_date, default_type_id, created_at, updated_at) values
-        (${projectIds[p.key]!}, ${p.key}, ${p.name}, ${p.description}, 'active', ${p.visibility}, ${users[p.lead]}, ${teams[p.team]!}, ${itemSeq},
-         ${daysFrom(now, -90)}, ${daysFrom(now, 120)}, ${typeByKey.task.id}, ${iso(origin)}, ${iso(origin)})`;
-      for (const m of p.members ?? []) await tx`insert into project_members (project_id, user_id, role, created_at, updated_at) values (${projectIds[p.key]!}, ${users[m.user]}, ${m.role}, ${iso(origin)}, ${iso(origin)})`;
+      await tx`insert into projects (id, key, name, description, status, visibility, lead_id, team_id, start_date, target_date, default_type_id) values
+        (${projectIds[p.key]!}, ${p.key}, ${p.name}, ${p.description}, 'active', ${p.visibility}::text::project_visibility, ${users[p.lead]}, ${teams[p.team]!},
+         ${daysFrom(now, -90)}, ${daysFrom(now, 120)}, ${typeByKey.task.id})`;
+      for (const m of p.members ?? []) await tx`insert into project_members (project_id, user_id, role) values (${projectIds[p.key]!}, ${users[m.user]}, ${m.role}::text::project_role)`;
       projectLabels[p.key] = {};
       for (const name of p.labels) {
         const id = uuid();
         projectLabels[p.key]![name] = id;
-        await tx`insert into labels (id, project_id, name, color, created_at, updated_at) values (${id}, ${projectIds[p.key]!}, ${name}, ${LABEL_COLORS[name] ?? '#0ea5e9'}, ${iso(origin)}, ${iso(origin)})`;
+        await tx`insert into labels (id, project_id, name, color) values (${id}, ${projectIds[p.key]!}, ${name}, ${LABEL_COLORS[name] ?? '#0ea5e9'})`;
         labelCount++;
       }
       for (const s of p.items) await insertItem(p, s, null);
-      if (numbering.get(p.key) !== itemSeq) throw new Error(`seed: ${p.key} numbered ${numbering.get(p.key)} items but item_seq is ${itemSeq}`);
     }
 
     // --- relations: blocks / duplicates / external links ---------------------
     const idOf = (title: string) => { const id = itemIdByTitle.get(title); if (!id) throw new Error(`seed: unknown item title "${title}"`); return id; };
     for (const it of inserted) {
-      const at = iso(new Date(it.createdAt.getTime() + 2 * HOUR));
       for (const t of it.seed.blocks ?? []) {
-        await tx`insert into relations (id, type, from_item_id, to_item_id, created_by, created_at, updated_at) values (${uuid()}, 'blocks', ${it.id}, ${idOf(t)}, ${users[it.reporter]}, ${at}, ${at})`;
+        await tx`insert into relations (id, type, from_item_id, to_item_id, created_by) values (${uuid()}, 'blocks', ${it.id}, ${idOf(t)}, ${users[it.reporter]})`;
         counts.relations++;
       }
       if (it.seed.duplicates) {
-        await tx`insert into relations (id, type, from_item_id, to_item_id, created_by, created_at, updated_at) values (${uuid()}, 'duplicates', ${it.id}, ${idOf(it.seed.duplicates)}, ${users[it.reporter]}, ${at}, ${at})`;
+        await tx`insert into relations (id, type, from_item_id, to_item_id, created_by) values (${uuid()}, 'duplicates', ${it.id}, ${idOf(it.seed.duplicates)}, ${users[it.reporter]})`;
         counts.relations++;
       }
       if (it.seed.pr) {
         const pr = it.seed.pr;
         const ref = { id: `${pr.repo}#${pr.number}`, url: `https://github.com/${pr.repo}/pull/${pr.number}`, repo: pr.repo, number: pr.number, title: pr.title, state: 'open' };
-        await tx`insert into relations (id, type, from_item_id, external_kind, external_ref, created_by, created_at, updated_at) values (${uuid()}, 'links_to', ${it.id}, 'github_pr', ${ref}, ${users[it.reporter]}, ${at}, ${at})`;
+        await tx`insert into relations (id, type, from_item_id, external_kind, external_ref, created_by) values (${uuid()}, 'links_to', ${it.id}, 'github_pr', ${tx.json(ref)}, ${users[it.reporter]})`;
         counts.relations++;
       }
     }
@@ -444,18 +364,17 @@ export async function seed(sql: Sql, opts: SeedOptions = {}): Promise<SeedSummar
     ];
     const commentEvents: { id: string; itemId: string; author: UserKey; at: Date }[] = [];
     for (const [i, c] of commentSeeds.entries()) {
-      const it = inserted.find((x) => x.title === c.title);
-      if (!it) throw new Error(`seed: comment on unknown item "${c.title}"`);
-      const at = new Date(Math.min(now.getTime() - (i + 1) * 5 * HOUR, it.createdAt.getTime() + 2 * DAY));
-      const createdAt = at < it.createdAt ? new Date(it.createdAt.getTime() + HOUR) : at;
+      const it = inserted.find((x) => x.title === c.title)!;
+      const at = new Date(Math.min(now.getTime() - (i + 1) * 3_600_000 * 5, it.createdAt.getTime() + 2 * DAY));
+      const createdAt = at < it.createdAt ? new Date(it.createdAt.getTime() + 3_600_000) : at;
       const id = uuid();
-      await tx`insert into comments (id, item_id, author_id, body, source, created_at, updated_at) values (${id}, ${it.id}, ${users[c.author]}, ${c.body}, 'app', ${iso(createdAt)}, ${iso(createdAt)})`;
+      await tx`insert into comments (id, item_id, author_id, body, source, created_at, updated_at) values (${id}, ${it.id}, ${users[c.author]}, ${c.body}, 'app', ${createdAt}, ${createdAt})`;
       counts.comments++;
       commentEvents.push({ id, itemId: it.id, author: c.author, at: createdAt });
       if (c.reply) {
         const rid = uuid();
         const rAt = new Date(createdAt.getTime() + 45 * 60_000);
-        await tx`insert into comments (id, item_id, author_id, body, parent_id, source, created_at, updated_at) values (${rid}, ${it.id}, ${users[c.reply.author]}, ${c.reply.body}, ${id}, 'app', ${iso(rAt)}, ${iso(rAt)})`;
+        await tx`insert into comments (id, item_id, author_id, body, parent_id, source, created_at, updated_at) values (${rid}, ${it.id}, ${users[c.reply.author]}, ${c.reply.body}, ${id}, 'app', ${rAt}, ${rAt})`;
         counts.comments++;
         commentEvents.push({ id: rid, itemId: it.id, author: c.reply.author, at: rAt });
       }
@@ -471,15 +390,15 @@ export async function seed(sql: Sql, opts: SeedOptions = {}): Promise<SeedSummar
     for (const c of commentEvents) addWatch(c.itemId, c.author, 'commenter');
     addWatch(idOf('Replace LIBOR fallback in swap pricer'), 'dan', 'mention');
     for (const w of watch.values()) {
-      await tx`insert into item_watchers (item_id, user_id, reason) values (${w.item}, ${users[w.user]}, ${w.reason})`;
+      await tx`insert into item_watchers (item_id, user_id, reason) values (${w.item}, ${users[w.user]}, ${w.reason}::text::watch_reason)`;
       counts.watchers++;
     }
 
-    // --- activity log (explicit created_at; JSON old/new via tx.json) --------
+    // --- activity log --------------------------------------------------------
     const event = async (e: { entity_type: string; entity_id: string; item_id: string | null; project_id: string; actor: UserKey; action: string; field?: string | null; old?: unknown; new?: unknown; mutation: string; at: Date; txn?: string }) => {
       await tx`insert into activity_events (txn_id, entity_type, entity_id, item_id, project_id, actor_kind, actor_id, actor_label, action, field, old_value, new_value, mutation_name, source, created_at)
         values (${e.txn ?? uuid()}, ${e.entity_type}, ${e.entity_id}, ${e.item_id}, ${e.project_id}, 'user', ${users[e.actor]}, null, ${e.action}, ${e.field ?? null},
-          ${e.old === undefined ? null : tx.json(e.old)}, ${e.new === undefined ? null : tx.json(e.new)}, ${e.mutation}, 'app', ${iso(e.at)})`;
+          ${e.old === undefined ? null : tx.json(e.old as never)}, ${e.new === undefined ? null : tx.json(e.new as never)}, ${e.mutation}, 'app', ${e.at})`;
       counts.events++;
     };
     for (const [i, it] of inserted.entries()) {
@@ -495,18 +414,18 @@ export async function seed(sql: Sql, opts: SeedOptions = {}): Promise<SeedSummar
           if (mid.id !== it.stateId) {
             await event({ entity_type: 'work_item', entity_id: it.id, item_id: it.id, project_id: it.project, actor, action: 'update', field: 'state_id', old: initial.id, new: mid.id, mutation: 'transitionItem', at });
           }
-          const finalAt = it.completedAt ?? new Date(Math.min(now.getTime() - HOUR, at.getTime() + 3 * DAY));
+          const finalAt = it.completedAt ?? new Date(Math.min(now.getTime() - 3_600_000, at.getTime() + 3 * DAY));
           await event({ entity_type: 'work_item', entity_id: it.id, item_id: it.id, project_id: it.project, actor, action: 'update', field: 'state_id', old: mid.id !== it.stateId ? mid.id : initial.id, new: it.stateId, mutation: 'transitionItem', at: finalAt, txn });
-          if (it.category === 'done') await event({ entity_type: 'work_item', entity_id: it.id, item_id: it.id, project_id: it.project, actor, action: 'update', field: 'completed_at', old: null, new: iso(finalAt), mutation: 'transitionItem', at: finalAt, txn });
+          if (it.category === 'done') await event({ entity_type: 'work_item', entity_id: it.id, item_id: it.id, project_id: it.project, actor, action: 'update', field: 'completed_at', old: null, new: finalAt.toISOString(), mutation: 'transitionItem', at: finalAt, txn });
         } else {
           await event({ entity_type: 'work_item', entity_id: it.id, item_id: it.id, project_id: it.project, actor, action: 'update', field: 'state_id', old: initial.id, new: it.stateId, mutation: 'transitionItem', at: new Date(it.createdAt.getTime() + 2 * DAY) });
         }
       }
       if (i % 9 === 4) {
-        await event({ entity_type: 'work_item', entity_id: it.id, item_id: it.id, project_id: it.project, actor: it.reporter, action: 'update', field: 'title', old: `Draft: ${it.title}`, new: it.title, mutation: 'updateItem', at: new Date(it.createdAt.getTime() + HOUR) });
+        await event({ entity_type: 'work_item', entity_id: it.id, item_id: it.id, project_id: it.project, actor: it.reporter, action: 'update', field: 'title', old: `Draft: ${it.title}`, new: it.title, mutation: 'updateItem', at: new Date(it.createdAt.getTime() + 3_600_000) });
       }
       if (i % 11 === 6 && it.assignee) {
-        await event({ entity_type: 'work_item', entity_id: it.id, item_id: it.id, project_id: it.project, actor: it.reporter, action: 'update', field: 'assignee_id', old: null, new: users[it.assignee], mutation: 'updateItem', at: new Date(it.createdAt.getTime() + 2 * HOUR) });
+        await event({ entity_type: 'work_item', entity_id: it.id, item_id: it.id, project_id: it.project, actor: it.reporter, action: 'update', field: 'assignee_id', old: null, new: users[it.assignee], mutation: 'updateItem', at: new Date(it.createdAt.getTime() + 2 * 3_600_000) });
       }
     }
     for (const c of commentEvents) {
@@ -518,8 +437,8 @@ export async function seed(sql: Sql, opts: SeedOptions = {}): Promise<SeedSummar
     const openFilter = { field: 'state.category', op: 'nin', value: ['done', 'canceled'] };
     const overdueFilter = { and: [{ field: 'due_date', op: 'before', value: '$today' }, openFilter] };
     const insertView = async (v: { project_id: string | null; owner_id: string | null; name: string; kind: string; spec: unknown; is_shared: boolean; is_default?: boolean; icon?: string; sort: number }) => {
-      await tx`insert into views (id, project_id, owner_id, name, kind, spec, is_shared, is_default, icon, sort, created_at, updated_at) values
-        (${uuid()}, ${v.project_id}, ${v.owner_id}, ${v.name}, ${v.kind}, ${tx.json(v.spec)}, ${v.is_shared}, ${v.is_default ?? false}, ${v.icon ?? null}, ${v.sort}, ${iso(origin)}, ${iso(origin)})`;
+      await tx`insert into views (id, project_id, owner_id, name, kind, spec, is_shared, is_default, icon, sort) values
+        (${uuid()}, ${v.project_id}, ${v.owner_id}, ${v.name}, ${v.kind}::text::view_kind, ${tx.json(v.spec as never)}, ${v.is_shared}, ${v.is_default ?? false}, ${v.icon ?? null}, ${v.sort})`;
       counts.views++;
     };
     for (const p of SEED_PROJECTS) {
@@ -553,21 +472,21 @@ export async function seed(sql: Sql, opts: SeedOptions = {}): Promise<SeedSummar
     // --- notification preferences --------------------------------------------
     let prefs = 0;
     for (const u of SEED_USERS) {
-      await tx`insert into notification_preferences (user_id, channel, cadence, created_at, updated_at) values (${users[u.key]}, 'in_app', 'immediate', ${iso(origin)}, ${iso(origin)})`;
-      await tx`insert into notification_preferences (user_id, channel, cadence, quiet_hours, created_at, updated_at) values (${users[u.key]}, 'email', 'daily', ${{ start: '19:00', end: '07:00', tz: 'Europe/London' }}, ${iso(origin)}, ${iso(origin)})`;
+      await tx`insert into notification_preferences (user_id, channel, cadence) values (${users[u.key]}, 'in_app', 'immediate')`;
+      await tx`insert into notification_preferences (user_id, channel, cadence, quiet_hours) values (${users[u.key]}, 'email', 'daily', ${tx.json({ start: '19:00', end: '07:00', tz: 'Europe/London' })})`;
       prefs += 2;
     }
 
     // --- webhook endpoint + integration configs (inactive) -------------------
-    await tx`insert into webhook_endpoints (id, name, url, secret, event_kinds, project_id, is_active, created_by, created_at, updated_at) values
-      (${uuid()}, 'Example sink', 'https://example.com/hook', ${'whsec_' + uuid().replace(/-/g, '')}, ${['*']}, null, ${false}, ${users.alice}, ${iso(origin)}, ${iso(origin)})`;
-    await tx`insert into integration_configs (kind, config, is_active, updated_by, updated_at) values
-      ('slack', ${{ team_id: 'T0EXAMPLE', channel_map: { RATES: 'C0RATES', EQD: 'C0EQD', OPS: 'C0OPS' }, notify_on: ['item.transitioned', 'comment.created'] }}, ${false}, ${users.alice}, ${iso(origin)}),
-      ('github', ${{ repos: ['firm/rates-platform', 'firm/eqd-tooling'], autolink: true, close_on_merge: true }}, ${false}, ${users.alice}, ${iso(origin)}),
-      ('email', ${{ inbound_domain: 'pm.firm.com', from: 'pm@firm.com' }}, ${false}, ${users.alice}, ${iso(origin)})`;
+    await tx`insert into webhook_endpoints (id, name, url, secret, event_kinds, project_id, is_active, created_by) values
+      (${uuid()}, 'Example sink', 'https://example.com/hook', ${'whsec_' + uuid().replace(/-/g, '')}, '{*}', null, false, ${users.alice})`;
+    await tx`insert into integration_configs (kind, config, is_active, updated_by) values
+      ('slack', ${tx.json({ team_id: 'T0EXAMPLE', channel_map: { RATES: 'C0RATES', EQD: 'C0EQD', OPS: 'C0OPS' }, notify_on: ['item.transitioned', 'comment.created'] })}, false, ${users.alice}),
+      ('github', ${tx.json({ repos: ['firm/rates-platform', 'firm/eqd-tooling'], autolink: true, close_on_merge: true })}, false, ${users.alice}),
+      ('email', ${tx.json({ inbound_domain: 'pm.firm.com', from: 'pm@firm.com' })}, false, ${users.alice})`;
 
     const summary: SeedSummary = {
-      users: SEED_USERS.length, teams: SEED_TEAMS.length, projects: SEED_PROJECTS.length, labels: labelCount, work_items: counts.items, relations: counts.relations,
+      users: SEED_USERS.length, teams: TEAMS.length, projects: SEED_PROJECTS.length, labels: labelCount, work_items: counts.items, relations: counts.relations,
       comments: counts.comments, watchers: counts.watchers, activity_events: counts.events, views: counts.views, notification_preferences: prefs,
       webhook_endpoints: 1, integration_configs: 3,
     };
@@ -576,10 +495,13 @@ export async function seed(sql: Sql, opts: SeedOptions = {}): Promise<SeedSummar
   });
 }
 
+const LABEL_COLORS: Record<string, string> = {
+  regulatory: '#ef4444', 'tech-debt': '#f59e0b', 'quick-win': '#10b981', sofr: '#6366f1', pricing: '#8b5cf6', vol: '#ec4899', greeks: '#14b8a6', kyc: '#f97316', runbook: '#64748b',
+};
+
 if (isMain(import.meta.url)) {
   const sql = connect();
   try {
-    console.log(`database: ${databasePath()}`);
     const s = await seed(sql, { force: hasFlag('--force'), log: (m) => console.log(m) });
     if (s) {
       console.log('seed users:');
@@ -587,6 +509,6 @@ if (isMain(import.meta.url)) {
       console.log(`projects: ${SEED_PROJECTS.map((p) => `${p.key} (${p.visibility})`).join(', ')}`);
     }
   } finally {
-    sql.close();
+    await sql.end({ timeout: 5 });
   }
 }

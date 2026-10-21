@@ -7,8 +7,21 @@ on:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pmtool
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     env:
-      DATABASE_URL: ./data/pmtool.db
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/pmtool
       APP_SECRET: ci-secret-at-least-32-bytes-long-0123456789
     steps:
       - uses: actions/checkout@v4
@@ -22,4 +35,8 @@ jobs:
       - run: pnpm -r --filter './packages/*' build
       - run: pnpm db:migrate
       - run: pnpm db:seed
+      - name: Create the database used by the SQL/local query parity tests
+        run: |
+          PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -v ON_ERROR_STOP=1 -c 'create database pmtool_core_test'
+          PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d pmtool_core_test -v ON_ERROR_STOP=1 -q -f packages/db/migrations/0001_init.sql
       - run: pnpm -r --filter './packages/*' test

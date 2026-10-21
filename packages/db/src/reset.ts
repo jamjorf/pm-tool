@@ -1,71 +1,49 @@
 // ============================================================================
-// Rebuild the database from scratch: remove the file -> migrate -> seed.
-//   pnpm --filter @pm/db reset
-// A SQLite database is always local (a file under the repo, or `:memory:`), so
-// no confirmation flag is needed; `--yes` is still accepted for scripts that
-// pass it, and is required only for a DATABASE_URL with a network scheme,
-// which cannot be a SQLite database anyway.
+// Drop everything and rebuild: schema -> migrations -> seed.
+//   pnpm --filter @pm/db reset [--yes]
+// Refuses non-local DATABASE_URL hosts unless --yes is passed.
 // ============================================================================
-import { existsSync, rmSync } from 'node:fs';
-import { databasePath, databaseUrl, hasFlag, isMain } from './client.js';
+import { connect, databaseUrl, hasFlag, isMain, type Sql } from './client.js';
 import { runMigrations } from './migrate.js';
 import { seed } from './seed.js';
-import { openDb } from './sqlite.js';
 
-const NETWORK_SCHEME = /^(postgres(ql)?|mysql|mariadb|mssql|mongodb(\+srv)?|redis|libsql|https?|wss?):\/\//i;
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]', 'postgres', 'db']);
 
-/**
- * True for `:memory:` and for any filesystem path (plain, `sqlite:` or `file:`
- * prefixed, relative or absolute) — there is no remote SQLite. Only a URL with
- * a network scheme such as `postgres://host/db` is considered non-local.
- */
 export function isLocalDatabaseUrl(url: string): boolean {
-  return !NETWORK_SCHEME.test(url.trim());
-}
-
-export interface ResetOptions {
-  log?: (message: string) => void;
+  try {
+    return LOCAL_HOSTS.has(new URL(url).hostname);
+  } catch {
+    return false;
+  }
 }
 
 /**
- * Delete the database file (plus its `-wal` / `-shm` / `-journal` siblings),
- * then run the migrations and the seed on a fresh connection. Takes a URL, not
- * a client: the file is removed from under any open handle, so callers must
- * open their own connection afterwards. For `:memory:` there is nothing to
- * delete; a fresh in-memory database is migrated and seeded, then closed
- * (useful only as a smoke test — the data is gone when this returns).
- *
- * Development only: do not run it while the API is serving the same file.
+ * Drop `public`, re-run migrations and seed. Takes a URL rather than a client on
+ * purpose: dropping the schema invalidates every prepared statement (and the
+ * type OIDs postgres.js caches) on an existing connection, so this opens its own
+ * short-lived connection with prepared statements disabled.
  */
-export async function reset(url: string = databaseUrl(), opts: ResetOptions = {}): Promise<void> {
+export async function reset(url: string = databaseUrl(), opts: { log?: (m: string) => void } = {}): Promise<void> {
   const log = opts.log ?? (() => undefined);
-  const path = databasePath(url);
-  if (path !== ':memory:') {
-    for (const f of [path, `${path}-wal`, `${path}-shm`, `${path}-journal`]) {
-      if (existsSync(f)) {
-        rmSync(f, { force: true });
-        log(`removed ${f}`);
-      }
-    }
-  }
-  const sql = openDb(path);
+  const sql: Sql = connect(url, { prepare: false });
   try {
+    await sql.unsafe('drop schema public cascade; create schema public;');
+    log('schema public dropped and recreated');
     const m = await runMigrations(sql, { log });
     log(`migrate: ${m.applied.length} applied`);
     const s = await seed(sql, { force: true, log });
     if (s) log(`seed: ${s.work_items} work items in ${s.projects} projects`);
   } finally {
-    sql.close(); // last connection: checkpoints and removes the -wal/-shm files
+    await sql.end({ timeout: 5 });
   }
 }
 
 if (isMain(import.meta.url)) {
   const url = databaseUrl();
   if (!isLocalDatabaseUrl(url) && !hasFlag('--yes')) {
-    console.error(`reset: ${url.replace(/\/\/.*@/, '//***@')} is not a local SQLite database (file path or :memory:); pass --yes to override`);
+    console.error(`reset: refusing to drop non-local database ${url.replace(/\/\/.*@/, '//***@')}; pass --yes to override`);
     process.exit(1);
   }
-  console.log(`database: ${databasePath(url)}`);
   await reset(url, { log: (m) => console.log(m) });
   console.log('reset: done');
 }

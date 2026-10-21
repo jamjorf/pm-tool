@@ -15,7 +15,7 @@ import { StateCategory, ViewKind } from '../schema/entities.js';
  *   "state.category" | "state.key"       (via workflow_states)
  *   "type.key"                           (via item_types)
  *   "project.key"                        (via projects)
- *   "fields.<key>"                       (JSON type-specific field)
+ *   "fields.<key>"                       (JSONB type-specific field)
  *   "labels"                             (array of label ids; ops: has / has_any / has_all / is_empty)
  *   "parent_id"                          (derived from relations parent_of)
  *   "is_blocked"                         (derived: has open blockers)
@@ -122,7 +122,7 @@ export interface QueryContext {
 /** Result of compiling a QuerySpec to SQL (server side). */
 export interface CompiledQuery {
   text: string;            // SELECT ... FROM work_items_v w ... WHERE ... ORDER BY ... LIMIT ...
-  values: unknown[];       // positional `?` params, in order (plain SQLite scalars)
+  values: unknown[];       // positional params ($1..$n)
   /** For group_by queries: SELECT <group>, count(*), ... */
   isAggregate: boolean;
 }

@@ -1,7 +1,7 @@
 // ============================================================================
 // Permissions contract. DECISION: per-project roles (RBAC) + firm role +
 // project visibility. One pure function decides everything; the DB mirrors it
-// in the effective_roles/visible_items views for sync-pull scoping.
+// in effective_project_role()/can_view_item() for sync-pull scoping.
 // Attribute-style conditions belong in workflow guards, not here.
 // ============================================================================
 import type { FirmRole, ProjectRole, ProjectVisibility } from '../schema/entities.js';

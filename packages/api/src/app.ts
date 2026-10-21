@@ -27,7 +27,6 @@ import './types.js';
 
 export interface BuildAppOptions {
   config?: Partial<Config>;
-  /** An already-open database (tests pass an in-memory one); the app closes only databases it opened itself. */
   db?: Sql;
   logger?: boolean | object;
   /** Mount /integrations/* from @pm/integrations (default true; skipped when the package is not built). */
@@ -124,7 +123,7 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
   }
 
   app.addHook('onClose', async () => {
-    if (!opts.db) db.close();
+    if (!opts.db) await db.end({ timeout: 5 });
   });
   return app;
 }

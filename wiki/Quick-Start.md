@@ -6,11 +6,11 @@ From a clean machine to a running pm-tool with seeded data, an API key and the M
 
 | Tool | Version | Notes |
 |---|---|---|
-| Node.js | 22.13+ | `package.json` declares `"engines": { "node": ">=22" }`; the database driver is Node's built-in `node:sqlite`, so no native module and no database server |
+| Node.js | 22+ | `package.json` declares `"engines": { "node": ">=22" }` |
 | pnpm | 10 | `corepack enable` picks up `"packageManager": "pnpm@10.28.0"` automatically |
+| Podman | 4.1+ | only for the bundled Postgres; skip it if you have Postgres 15+. `podman compose` needs a provider: `pip install podman-compose` or `dnf/apt install podman-compose` |
+| Postgres | 15+ | `podman compose up -d postgres` starts Postgres 16 on `:5432` from `compose.yml` |
 | git | any | |
-
-That is the whole list: no Podman, no Docker, no Postgres, no `sudo`. The database is a SQLite file that `pnpm db:migrate` creates at `./data/pmtool.db`. The `sqlite3` command-line shell is optional and only useful for looking at the file by hand.
 
 ```bash
 corepack enable        # makes the pinned pnpm version available
@@ -24,14 +24,15 @@ pnpm --version         # 10.x
 git clone https://github.com/jamjorf/pm-tool.git
 cd pm-tool
 
-cp .env.example .env                 # DATABASE_URL=./data/pmtool.db
+cp .env.example .env
+podman compose up -d postgres        # or point DATABASE_URL at your own Postgres 15+
 pnpm install
 pnpm --filter @pm/core build         # other packages import @pm/core from its dist
-pnpm db:migrate && pnpm db:seed      # creates ./data/pmtool.db, applies 0001_init.sql, loads demo data
+pnpm db:migrate && pnpm db:seed
 pnpm dev                             # API on :3001, web on :5173
 ```
 
-`scripts/dev.sh` does all of the above in one go (it copies `.env`, installs, builds core and db, migrates, seeds and starts `pnpm dev`). Nothing has to be running beforehand.
+`scripts/dev.sh` does all of the above in one go (it copies `.env`, waits for Postgres, installs, builds core, migrates, seeds and starts `pnpm dev`).
 
 Open http://localhost:5173.
 
@@ -132,12 +133,11 @@ Then ask Claude Code "what's on my plate in RATES?" and it will call `my_work` a
 | Symptom | Fix |
 |---|---|
 | `EADDRINUSE` on 3001 or 5173 | Something else is listening. Change `PORT` in `.env` for the API (and `API_URL` to match), or start the web app on another port with `pnpm --filter @pm/web exec vite --port 5174`. |
-| `database is locked` / `SQLITE_BUSY` | Another process holds the file's write lock: a second `pnpm dev:api`, a `sqlite3` shell inside an open transaction, or a test run against the same file. Stop it. The API waits up to `busy_timeout` (5 s) before failing, and queues its own transactions behind an in-process mutex, so this only happens across processes. |
-| Where is the database? | `./data/pmtool.db` under the repo root (git-ignored), plus `pmtool.db-wal` and `pmtool.db-shm` while the API runs. `DATABASE_URL` in `.env` accepts a relative or absolute path, a `sqlite:`/`file:` prefix, or `:memory:`. Inspect it with `sqlite3 data/pmtool.db` (`.tables`, `select * from work_items_v limit 5;`). |
+| `ECONNREFUSED` / `password authentication failed` | Check `DATABASE_URL` in `.env` (default `postgres://postgres:postgres@localhost:5432/pmtool`) and that `podman compose ps` shows Postgres healthy (rootless Podman publishes `5432` on localhost by default). |
 | `Cannot find module '@pm/core'` or typecheck errors in api/web/mcp | Run `pnpm --filter @pm/core build` first. Other packages import `@pm/core` from its `dist`, so a fresh clone must build core before `pnpm -r typecheck`, `pnpm -r test` or `pnpm -r build`. |
 | React type errors from `react-router`, `cmdk`, `dnd-kit` | `.npmrc` hoists `@types/react` and `@types/react-dom` to the root (`public-hoist-pattern`). If you changed `.npmrc` or installed with another package manager, restore it and run `pnpm install` again. |
 | Seed says users already exist | `pnpm db:seed` is a no-op when any user exists. Use `pnpm --filter @pm/db seed --force` to wipe data tables and reseed, or start over below. |
-| Want a clean database | `pnpm db:reset -- --yes` removes the local database file (and its `-wal`/`-shm` files), migrates and seeds; it refuses anything that is not a local file path. Equivalent by hand: stop the API, `rm data/pmtool.db*`, then `pnpm db:migrate && pnpm db:seed`. |
+| Want a clean database | `pnpm db:reset -- --yes` drops the schema, migrates and seeds (local databases only). |
 | Dev login returns 403 | `AUTH_MODE` is not `dev`. Set `AUTH_MODE=dev` in `.env` and restart the API. |
 | Magic link never arrives | With no `SMTP_URL` the link is logged by the API process; copy it from the terminal. |
 

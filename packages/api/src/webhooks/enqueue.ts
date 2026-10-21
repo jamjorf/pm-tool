@@ -16,7 +16,7 @@ interface Group { itemId: string | null; projectId: string | null; events: Event
 /** Enqueue webhook_deliveries for this mutation: one delivery per (endpoint, txn, item). */
 export async function enqueueWebhooks(ctx: MutationCtx): Promise<number> {
   if (!ctx.events.length) return 0;
-  const endpoints = await ctx.tx`select * from webhook_endpoints where is_active = 1 and deleted_at is null`;
+  const endpoints = await ctx.tx`select * from webhook_endpoints where is_active and deleted_at is null`;
   if (!endpoints.length) return 0;
 
   const groups = new Map<string, Group>();
@@ -54,10 +54,8 @@ export async function enqueueWebhooks(ctx: MutationCtx): Promise<number> {
       const kind = pickPrimaryKind(allowed);
       const payload = { id: null as string | null, kind, created_at: new Date().toISOString(), actor, project: project ?? null, item, changes, event_ids: eventIds };
       const [d] = await ctx.tx`
-        insert into webhook_deliveries (endpoint_id, event_id, event_kind, payload) values (${ep.id}, ${eventIds[0]!}, ${kind}, ${ctx.tx.json(payload)}) returning id`;
-      // The delivery id becomes payload.id (X-PM-Delivery): rebuild the JSON in JS instead of `payload || jsonb_build_object(...)`.
-      payload.id = String(d!.id);
-      await ctx.tx`update webhook_deliveries set payload = ${ctx.tx.json(payload)} where id = ${d!.id}`;
+        insert into webhook_deliveries (endpoint_id, event_id, event_kind, payload) values (${ep.id}, ${eventIds[0]!}, ${kind}, ${ctx.tx.json(payload as any)}) returning id`;
+      await ctx.tx`update webhook_deliveries set payload = payload || jsonb_build_object('id', ${String(d!.id)}::text) where id = ${d!.id}`;
       count++;
     }
   }

@@ -1,25 +1,19 @@
 import type { FastifyInstance, InjectOptions } from 'fastify';
-import { openDb } from '@pm/db/sqlite';
-import { runMigrations } from '@pm/db/migrate';
 import { buildApp } from '../src/app.js';
 
-/** Fresh in-memory SQLite database with the migration applied; closed when the app closes. */
+export const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? 'postgres://postgres:postgres@127.0.0.1:5432/pmtool_api_test';
+
 export async function startApp(): Promise<FastifyInstance> {
-  const db = openDb(':memory:');
-  await runMigrations(db);
-  const app = await buildApp({
-    config: { DATABASE_URL: ':memory:', WORKERS: false, LOG_LEVEL: 'silent', AUTH_MODE: 'dev', APP_URL: 'http://localhost:5173' },
-    db,
+  return buildApp({
+    config: { DATABASE_URL: TEST_DB_URL, WORKERS: false, LOG_LEVEL: 'silent', AUTH_MODE: 'dev', APP_URL: 'http://localhost:5173' },
     logger: false,
     integrations: false,
   });
-  app.addHook('onClose', async () => db.close());
-  return app;
 }
 
 export interface Session { cookie: string; user: any; headers: Record<string, string> }
 
-/** Dev-login; `role` promotes the user (only the very first user of a database is a natural owner). */
+/** Dev-login; `role` promotes the user (the test DB is shared across files, so only the very first user is a natural owner). */
 export async function login(app: FastifyInstance, email: string, name?: string, role?: 'owner' | 'admin' | 'member' | 'guest'): Promise<Session> {
   const res = await app.inject({ method: 'POST', url: '/auth/dev-login', payload: { email, name } });
   if (res.statusCode !== 200) throw new Error(`dev-login failed: ${res.statusCode} ${res.body}`);
@@ -27,8 +21,7 @@ export async function login(app: FastifyInstance, email: string, name?: string, 
   if (!c) throw new Error('no session cookie');
   let user = res.json().user;
   if (role && user.firm_role !== role) {
-    await app.db`update users set firm_role = ${role} where id = ${user.id}`;
-    [user] = await app.db`select * from users where id = ${user.id}`;
+    [user] = await app.db`update users set firm_role = ${role} where id = ${user.id} returning *`;
   }
   return { cookie: c.value, user, headers: { cookie: `pm_session=${encodeURIComponent(c.value)}` } };
 }
@@ -74,6 +67,3 @@ export const expectOk = (res: Res, status = 200) => {
   if (res.status !== status) throw new Error(`expected ${status}, got ${res.status}: ${JSON.stringify(res.body)}`);
   return res.body;
 };
-
-/** `select count(*)` as a number. */
-export const count = async (app: FastifyInstance, q: PromiseLike<any[]>): Promise<number> => Number((await q)[0]?.n ?? 0);

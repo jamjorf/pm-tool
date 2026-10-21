@@ -1,77 +1,61 @@
-// ============================================================================
-// The API's single import point for the database layer (@pm/db on node:sqlite).
-//
-//   const rows = await q`select * from work_items where id = ${id}`;   // hydrated rows
-//   await sql.begin(async (tx) => { ... });                           // BEGIN IMMEDIATE (serialised writer)
-//   `where id in ${q(ids)}`                                           // IN list
-//   `set ${setOf(q, updates)}`                                        // dynamic UPDATE ... SET
-//
-// Conventions the rest of the API relies on:
-//   * booleans are 0/1 in SQL (JS booleans passed as params are converted; `is_*`,
-//     `confidential`, `muted`, `resync_required` come back as booleans)
-//   * JSON columns (fields, settings, spec, payload, scopes, event_kinds, label_ids, ...)
-//     are text in SQL and parsed on the way out; objects/arrays passed as params are
-//     serialised; use `q.json(v)` to force JSON for scalars (activity old/new values)
-//   * timestamps are ISO-8601 text; compare as text and pass `nowIso()` instead of now()
-//   * `insert ... returning *` runs BEFORE the AFTER INSERT triggers (number/key/version
-//     are not filled in yet) — re-read the row when you need them
-//   * never hold `sql.begin()` across network I/O: the transaction mutex blocks every
-//     other request while it is open
-// ============================================================================
-import { openDb, isUuid, nowIso, sqliteErrorKind, type Sql as DbSql, type Row as DbRow, type Fragment } from '@pm/db/sqlite';
-import { ftsQuery } from '@pm/core';
+import postgres from 'postgres';
 
-export type Sql = DbSql;
-/** Transaction handle (same interface; statements issued inside `begin()` run in the transaction). */
-export type Tx = Sql;
-/** Any query runner (the shared connection or an open transaction). */
-export type Q = Sql;
-export type Row = DbRow;
-export type { Fragment };
-export { isUuid, nowIso, sqliteErrorKind };
+export type Sql = postgres.Sql<{}>;
+export type Tx = postgres.TransactionSql<{}>;
+/** Any query runner (connection pool or an open transaction). */
+export type Q = Sql | Tx;
+export type Row = Record<string, any>;
 
-/** Open the SQLite database at `url` (a path, `sqlite:path`, `file:path` or `:memory:`). */
-export function createDb(url: string): Sql {
-  return openDb(url);
+/** Advisory lock taken by every write transaction so `version` order == commit order. */
+export const SYNC_LOCK_ID = 42;
+
+function pgTimestampToIso(x: string): string {
+  const d = new Date(x);
+  return Number.isNaN(d.getTime()) ? x : d.toISOString();
 }
-
-/** Run `fn` in a write transaction (BEGIN IMMEDIATE). Writers are serialised, so `version` order == commit order. */
-export async function withTxn<T>(sql: Sql, fn: (tx: Tx) => Promise<T>): Promise<T> {
-  return sql.begin(fn);
-}
-
-/** Current global sync version (sync_state.version). */
-export async function currentVersion(q: Q): Promise<number> {
-  return q.currentVersion();
-}
-
-const IDENT_RE = /^[a-z_][a-z0-9_]*$/;
-
-/** `col = ?, col2 = ?` fragment for dynamic updates; keys are validated identifiers, values are bound. */
-export function setOf(q: Q, updates: Record<string, unknown>): Fragment {
-  const keys = Object.keys(updates);
-  if (!keys.length) throw new Error('setOf: nothing to update');
-  for (const k of keys) if (!IDENT_RE.test(k)) throw new Error(`setOf: invalid column "${k}"`);
-  return q.unsafe(keys.map((k) => `${k} = ?`).join(', '), keys.map((k) => updates[k])).fragment;
-}
-
-/** Empty fragment, for optional clauses: `${cond ? q\`and x = ${v}\` : nothing(q)}`. */
-export const nothing = (q: Q): Fragment => q.raw('');
-
-/** ISO timestamp `ms` milliseconds from now (positive or negative). */
-export const isoIn = (ms: number): string => new Date(Date.now() + ms).toISOString();
-
-/** `YYYY-MM-DD` (UTC) `days` days from today. */
-export const dateIn = (days: number): string => new Date(Date.now() + days * 86_400_000).toISOString().slice(0, 10);
-
-/** Escape `%`, `_` and `\` for a LIKE pattern used with `escape '\'`. */
-export const escapeLike = (s: string): string => s.replace(/[\\%_]/g, (c) => '\\' + c);
 
 /**
- * Safe FTS5 MATCH string from free text (same builder as the QuerySpec `search` op in @pm/core:
- * every whitespace-separated token becomes a quoted phrase, so user punctuation cannot break the
- * query). null when there is no token.
+ * postgres.js client. Rows are returned exactly as SQL (snake_case).
+ * Parsers: bigint/numeric -> number, date -> 'YYYY-MM-DD' string, timestamps -> ISO strings,
+ * so rows can be JSON-serialized and diffed without surprises.
  */
-export function ftsMatch(text: string): string | null {
-  return ftsQuery(text) || null;
+export function createDb(url: string, opts: { max?: number } = {}): Sql {
+  return postgres(url, {
+    max: opts.max ?? 10,
+    transform: { undefined: null },
+    onnotice: () => {},
+    types: {
+      bigint: { to: 20, from: [20], serialize: (x: unknown) => String(x), parse: (x: string) => Number(x) },
+      numeric: { to: 1700, from: [1700], serialize: (x: unknown) => String(x), parse: (x: string) => Number(x) },
+      date: {
+        to: 1082,
+        from: [1082],
+        serialize: (x: unknown) => (x instanceof Date ? x.toISOString().slice(0, 10) : String(x)),
+        parse: (x: string) => x,
+      },
+      timestamp: {
+        to: 1184,
+        from: [1114, 1184],
+        serialize: (x: unknown) => (x instanceof Date ? x.toISOString() : String(x)),
+        parse: pgTimestampToIso,
+      },
+    },
+  });
+}
+
+/** Run `fn` in a transaction that holds the global sync advisory lock (write path). */
+export async function withTxn<T>(sql: Sql, fn: (tx: Tx) => Promise<T>): Promise<T> {
+  return (await sql.begin(async (tx) => {
+    await tx`select pg_advisory_xact_lock(${SYNC_LOCK_ID})`;
+    return fn(tx);
+  })) as T;
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const isUuid = (s: unknown): s is string => typeof s === 'string' && UUID_RE.test(s);
+
+/** Current global sync version (last value handed out by sync_version_seq). */
+export async function currentVersion(q: Q): Promise<number> {
+  const [r] = await q`select last_value::bigint as v, is_called from sync_version_seq`;
+  return r?.is_called ? Number(r.v) : 0;
 }

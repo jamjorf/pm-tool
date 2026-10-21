@@ -17,7 +17,7 @@ A transition is allowed when every guard passes. Failures come back as `{ guard,
 | `require_field` | `{"type":"require_field","field":"assignee_id"}` | the column or `fields.<key>` is non-null and non-empty | "needs an assignee before Start" |
 | `field_equals` | `{"type":"field_equals","field":"fields.risk_signoff","value":true}` | the value equals `value` | sign-off flag must be true |
 | `field_in` | `{"type":"field_in","field":"fields.severity","values":["s1","s2"]}` | the value is in `values` | only high severities may escalate |
-| `no_open_blockers` | `{"type":"no_open_blockers"}` | `open_blockers` has no row for the item | dependency gating |
+| `no_open_blockers` | `{"type":"no_open_blockers"}` | `item_open_blockers(id)` is empty | dependency gating |
 | `children_in_category` | `{"type":"children_in_category","categories":["done","canceled"]}` | every direct child's state category is in the list | cannot complete an initiative with open children |
 | `require_role` | `{"type":"require_role","roles":["admin"]}` | the actor's effective project role is in `roles` | only desk heads approve |
 | `require_assignee_is_actor` | `{"type":"require_assignee_is_actor"}` | `assignee_id` equals the actor | only the owner marks it done |
@@ -36,7 +36,7 @@ Effects run after the guards pass. `set_field` is applied in the same patch as `
 | `transition_parent_if` | `{"type":"transition_parent_if","all_children_category":["done","canceled"],"to":"done"}` | if all the parent's children are in those categories, run the parent's transition into state key `to` | server, recursive |
 | `transition_children` | `{"type":"transition_children","to":"canceled"}` | run the transition into `to` on every direct child; children whose guards fail are skipped and reported | server, recursive |
 
-Recursion is bounded by the hierarchy depth (`item_ancestry` caps at 100).
+Recursion is bounded by the hierarchy depth (`item_descendants` caps at 100).
 
 ## The seeded Standard workflow
 
@@ -97,12 +97,12 @@ insert into workflows (id, key, name, description) values
    'Proposed -> Implemented -> Validated -> Approved (4-eyes) -> Released | Rejected');
 
 insert into workflow_states (id, workflow_id, key, name, category, color, sort, is_initial) values
-  ('22222222-0000-0000-0000-000000000011', '22222222-0000-0000-0000-000000000001', 'proposed',    'Proposed',    'todo',        '#9ca3af', 0, 1),
-  ('22222222-0000-0000-0000-000000000012', '22222222-0000-0000-0000-000000000001', 'implemented', 'Implemented', 'in_progress', '#60a5fa', 1, 0),
-  ('22222222-0000-0000-0000-000000000013', '22222222-0000-0000-0000-000000000001', 'validated',   'Validated',   'in_progress', '#f59e0b', 2, 0),
-  ('22222222-0000-0000-0000-000000000014', '22222222-0000-0000-0000-000000000001', 'approved',    'Approved',    'in_progress', '#a78bfa', 3, 0),
-  ('22222222-0000-0000-0000-000000000015', '22222222-0000-0000-0000-000000000001', 'released',    'Released',    'done',        '#10b981', 4, 0),
-  ('22222222-0000-0000-0000-000000000016', '22222222-0000-0000-0000-000000000001', 'rejected',    'Rejected',    'canceled',    '#6b7280', 5, 0);
+  ('22222222-0000-0000-0000-000000000011', '22222222-0000-0000-0000-000000000001', 'proposed',    'Proposed',    'todo',        '#9ca3af', 0, true),
+  ('22222222-0000-0000-0000-000000000012', '22222222-0000-0000-0000-000000000001', 'implemented', 'Implemented', 'in_progress', '#60a5fa', 1, false),
+  ('22222222-0000-0000-0000-000000000013', '22222222-0000-0000-0000-000000000001', 'validated',   'Validated',   'in_progress', '#f59e0b', 2, false),
+  ('22222222-0000-0000-0000-000000000014', '22222222-0000-0000-0000-000000000001', 'approved',    'Approved',    'in_progress', '#a78bfa', 3, false),
+  ('22222222-0000-0000-0000-000000000015', '22222222-0000-0000-0000-000000000001', 'released',    'Released',    'done',        '#10b981', 4, false),
+  ('22222222-0000-0000-0000-000000000016', '22222222-0000-0000-0000-000000000001', 'rejected',    'Rejected',    'canceled',    '#6b7280', 5, false);
 
 insert into workflow_transitions (workflow_id, key, name, from_state_id, to_state_id, guards, effects, sort) values
   -- the implementer moves it forward; must own it and name the model
@@ -134,7 +134,7 @@ insert into workflow_transitions (workflow_id, key, name, from_state_id, to_stat
    '[]', '[{"type":"set_field","field":"canceled_at","value":null}]', 5);
 
 insert into item_types (key, name, plural_name, icon, color, workflow_id, is_container, sort, field_defs) values
-  ('model_change', 'Model change', 'Model changes', 'git-branch', '#a78bfa', '22222222-0000-0000-0000-000000000001', 0, 11,
+  ('model_change', 'Model change', 'Model changes', 'git-branch', '#a78bfa', '22222222-0000-0000-0000-000000000001', false, 11,
    '[{"key":"model","label":"Model","kind":"select","required":true,
       "options":[{"value":"curve","label":"Curve builder"},{"value":"vol","label":"Vol surface"},{"value":"xva","label":"XVA engine"}]},
      {"key":"change_class","label":"Change class","kind":"select",
@@ -220,4 +220,4 @@ Clients receive the new states, transitions and `field_defs` on the next sync pu
 - `POST /api/v1/items/bulk-transition {keys, transition_key}` evaluates each item independently and returns `{ok:[], failed:[{id, failures}]}`.
 - Over sync, a transition the server rejects is rolled back on the next pull and explained by a `mutation_rejected` inbox row (see [[Sync]]).
 
-The engine's `GuardContext` is `{ actorId, actorRole, now, openBlockerCount, childrenCategories, labelNames }`; the server loads it from the `effective_roles` and `open_blockers` views, the direct children's states (`item_parents`) and `work_item_labels`. See [docs/02-design.md §4](https://github.com/jamjorf/pm-tool/blob/main/docs/02-design.md#4-workflow-engine-at-runtime).
+The engine's `GuardContext` is `{ actorId, actorRole, now, openBlockerCount, childrenCategories, labelNames }`; the server loads it from `effective_project_role()`, `item_open_blockers()`, the direct children's states and `work_item_labels`. See [docs/02-design.md §4](https://github.com/jamjorf/pm-tool/blob/main/docs/02-design.md#4-workflow-engine-at-runtime).

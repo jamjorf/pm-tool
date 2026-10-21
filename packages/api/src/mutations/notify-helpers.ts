@@ -12,6 +12,6 @@ export function actorName(ctx: MutationCtx): Promise<string> {
 export const snippet = (s: string | null | undefined, n = 200) => (s ? (s.length > n ? s.slice(0, n - 1) + '…' : s) : null);
 
 export async function watcherIds(ctx: MutationCtx, itemId: string): Promise<string[]> {
-  const rows = await ctx.tx`select user_id from item_watchers where item_id = ${itemId} and deleted_at is null and muted = 0`;
+  const rows = await ctx.tx`select user_id from item_watchers where item_id = ${itemId} and deleted_at is null and not muted`;
   return rows.map((r) => r.user_id);
 }

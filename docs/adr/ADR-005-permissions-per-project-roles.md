@@ -22,12 +22,10 @@ access decision after the fact.
 * `work_items.confidential`: visible to project admins and to the item's
   assignee, reporter and creator only.
 
-Two SQL views decide everything on the server (REST, sync pull, export,
-search): `effective_roles(user_id, project_id, role)` (the role lattice) and
-`visible_items(user_id, item_id)` (role plus the confidential rule); every
-item read appends `exists (select 1 from visible_items vi where vi.user_id = ?
-and vi.item_id = w.id)`. `permissions.can()` in `@pm/core` mirrors the lattice
-for the UI with a per-action minimum role table.
+One SQL function `effective_project_role(user, project)` and two derived ones
+(`can_view_item`, `visible_project_ids`) decide everything on the server
+(REST, sync pull, export, search); `permissions.can()` in `@pm/core` mirrors
+the lattice for the UI with a per-action minimum role table.
 
 **Attribute-style conditions are placed in workflow guards**
 (`require_role`, `require_label`, `field_equals`, `require_assignee_is_actor`),
@@ -47,8 +45,8 @@ through a step*, not about who may see it.
 * (−) Visibility changes (membership removal, project made private, item
   moved) require a full client resync (`resync_required`).
 * (−) If a genuinely attribute-driven requirement appears (e.g. "desk X may
-  see items whose `fields.desk = X` in any project"), it must be added to the
-  `visible_items` view — a single view, but a change to the contract.
+  see items whose `fields.desk = X` in any project"), it must be added to
+  `can_view_item()` — a single function, but a change to the contract.
 
 ## Alternatives considered
 
@@ -60,8 +58,6 @@ through a step*, not about who may see it.
   become the product.
 * **Firm-wide flat access.** Simplest; rejected because compliance and
   external parties need scoping from day one.
-* **Database row-level security as the primary mechanism.** Not available in
-  SQLite (no roles), and in any case the application needs the same decisions
-  in TypeScript for optimistic UI. The `visible_items` view is written so it
-  can become an RLS policy expression if the data moves to Postgres
-  (ADR-009).
+* **Postgres RLS as the primary mechanism.** Kept as an extension path (the
+  functions are RLS-ready); not the primary mechanism because the application
+  needs the same decisions in TypeScript for optimistic UI.

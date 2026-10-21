@@ -3,7 +3,7 @@ import type { Actor } from '@pm/core';
 import { z } from 'zod';
 import { isUuid, type Q } from '../db.js';
 import { notFound, unauthorized, validation } from '../errors.js';
-import { effectiveRoleOf, resolveItemId, resolveProjectId } from '../mutations/helpers.js';
+import { resolveItemId, resolveProjectId } from '../mutations/helpers.js';
 
 export const actorOf = (request: FastifyRequest): Actor => {
   if (!request.actor) throw unauthorized();
@@ -45,8 +45,8 @@ export async function projectIdQuery(q: Q, request: FastifyRequest, name = 'proj
   const id = await resolveProjectId(q, v);
   const actor = request.actor;
   if (actor) {
-    const role = await effectiveRoleOf(q, actor.id, id);
-    if (!role) throw notFound(`project ${v} not found`);
+    const [r] = await q`select effective_project_role(${actor.id}, ${id}) as role`;
+    if (!r?.role) throw notFound(`project ${v} not found`);
   }
   return id;
 }

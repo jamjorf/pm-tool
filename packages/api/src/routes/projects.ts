@@ -5,7 +5,7 @@ import { MutationArgs, ProjectRole } from '@pm/core';
 import { requireAuth } from '../auth/plugin.js';
 import { notFound } from '../errors.js';
 import { permissions } from '../core-compat.js';
-import { getProject, projectCtx, visibleItem, visibleProjects } from '../mutations/helpers.js';
+import { getProject, projectCtx } from '../mutations/helpers.js';
 import { actorOf, flag, parse, paramsOf, projectIdParam, queryOf, zUuid } from './util.js';
 
 export async function projectRoutes(app: FastifyInstance) {
@@ -17,9 +17,9 @@ export async function projectRoutes(app: FastifyInstance) {
     const includeArchived = flag(queryOf(request).include_archived);
     const projects = await db`
       select p.*, u.name as lead_name,
-        (select count(*) from work_items w join workflow_states s on s.id = w.state_id where w.project_id = p.id and w.deleted_at is null and s.category not in ('done','canceled')) as open_count
+        (select count(*)::int from work_items w join workflow_states s on s.id = w.state_id where w.project_id = p.id and w.deleted_at is null and s.category not in ('done','canceled')) as open_count
       from projects p left join users u on u.id = p.lead_id
-      where p.deleted_at is null and p.id in ${visibleProjects(db, actor.id)}
+      where p.deleted_at is null and p.id in (select visible_project_ids(${actor.id}))
         and (${includeArchived} or p.archived_at is null)
       order by p.key`;
     return { projects };
@@ -46,12 +46,12 @@ export async function projectRoutes(app: FastifyInstance) {
       select m.user_id, m.role, u.name, u.email, u.avatar_url from project_members m join users u on u.id = m.user_id
       where m.project_id = ${project.id} and m.deleted_at is null and u.deleted_at is null order by u.name`;
     const counts = await db`
-      select s.category, count(*) as count from work_items w join workflow_states s on s.id = w.state_id
-      where w.project_id = ${project.id} and w.deleted_at is null and ${visibleItem(db, actor.id, 'w.id')} group by s.category`;
+      select s.category, count(*)::int as count from work_items w join workflow_states s on s.id = w.state_id
+      where w.project_id = ${project.id} and w.deleted_at is null and can_view_item(${actor.id}, w.id) group by s.category`;
     const views = await db`
-      select * from views where project_id = ${project.id} and deleted_at is null and (owner_id = ${actor.id} or is_shared = 1) order by sort, name`;
+      select * from views where project_id = ${project.id} and deleted_at is null and (owner_id = ${actor.id} or is_shared) order by sort, name`;
     const item_counts: Record<string, number> = {};
-    for (const c of counts) item_counts[c.category] = Number(c.count);
+    for (const c of counts) item_counts[c.category] = c.count;
     return { ...project, members, item_counts, views, effective_role: permissions.effectiveRole(actor, projectCtx(project)) };
   });
 

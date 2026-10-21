@@ -5,8 +5,7 @@ const bool = z
   .transform((v) => (typeof v === 'boolean' ? v : !['0', 'false', 'no', 'off', ''].includes(v.toLowerCase())));
 
 const ConfigSchema = z.object({
-  /** SQLite database: a path (relative to the repo root), `sqlite:path`, `file:path` or `:memory:`. */
-  DATABASE_URL: z.string().default('./data/pmtool.db'),
+  DATABASE_URL: z.string().default('postgres://postgres:postgres@localhost:5432/pmtool'),
   PORT: z.coerce.number().int().positive().default(3001),
   HOST: z.string().default('0.0.0.0'),
   APP_SECRET: z.string().min(16).default('change-me-please-32-bytes-minimum-secret'),

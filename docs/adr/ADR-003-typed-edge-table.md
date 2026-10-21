@@ -14,8 +14,7 @@ cheap and must stay correct as desks add new kinds of relation.
 
 A single `relations` table: `type → relation_types(key)`, `from_item_id`,
 `to_item_id` (nullable), and for external entities `external_kind` +
-`external_ref` (JSON text) with a generated `external_key` for idempotent
-linking.
+`external_ref jsonb` with a generated `external_key` for idempotent linking.
 `relation_types` is a registry with flags `is_hierarchy`, `is_blocking`,
 `is_symmetric`; seeded with `parent_of`, `blocks`, `duplicates`,
 `relates_to`, `links_to`.
@@ -23,10 +22,9 @@ linking.
 Invariants in the database: a check constraint for the internal/external
 shape, no self-edges, unique (type, from, to), a partial unique index giving
 every item at most one parent, and a trigger that refuses cycles in any
-hierarchy or blocking type (and refuses the reverse of a symmetric edge).
-Graph queries are views (SQLite has no SQL functions): `item_parents`,
-`item_ancestry`, `open_blockers`, `item_rollups`; the `work_items_v` view
-exposes `parent_id` and `is_blocked`.
+hierarchy or blocking type. Graph queries are SQL functions:
+`item_descendants`, `item_ancestors`, `item_open_blockers`, `item_rollup`;
+the `work_items_v` view exposes `parent_id` and `is_blocked`.
 
 ## Consequences
 

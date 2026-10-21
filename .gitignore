@@ -10,7 +10,3 @@ coverage/
 .vite/
 packages/web/dist/
 *.tsbuildinfo
-data/
-*.db
-*.db-wal
-*.db-shm

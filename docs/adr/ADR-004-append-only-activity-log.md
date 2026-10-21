@@ -13,18 +13,16 @@ change.
 
 ## Decision
 
-`activity_events`: `id integer primary key autoincrement` (monotonic cursor;
-ids are never reused), `txn_id` (one per mutation), `entity_type`/`entity_id`,
-denormalised `item_id` and `project_id`, `actor_kind` (user / api_key /
-integration / system / agent), `actor_id`, `actor_label`, `action`, `field`,
-`old_value` and `new_value` (JSON text), `mutation_name`, `source`,
-`created_at`.
+`activity_events`: `id bigint identity` (monotonic cursor), `txn_id`
+(one per mutation), `entity_type`/`entity_id`, denormalised `item_id` and
+`project_id`, `actor_kind` (user / api_key / integration / system / agent),
+`actor_id`, `actor_label`, `action`, `field`, `old_value jsonb`,
+`new_value jsonb`, `mutation_name`, `source`, `created_at`.
 
-**One row per changed field** (JSON keys as `fields.<key>`), written by the
+**One row per changed field** (JSONB keys as `fields.<key>`), written by the
 single server-side `applyMutation()` after diffing before/after. **Append-only
-is enforced by triggers** that raise on UPDATE and DELETE (SQLite has no
-TRUNCATE; a bare DELETE still fires the trigger). Every other table uses soft
-deletes so the log never references vanished rows.
+is enforced by triggers** that raise on UPDATE, DELETE and TRUNCATE. Every
+other table uses soft deletes so the log never references vanished rows.
 
 Derived consumers read the log rather than being told about changes:
 notifications and webhooks reference `event_id`; feeds page on `id`; undo
@@ -36,17 +34,15 @@ throughput) are queries on `state_id` events.
 * (+) One source of truth for history, audit, notifications, webhooks, undo
   and analytics; they cannot disagree.
 * (+) Immutability is a database property, not an application promise;
-  combined with file permissions and immutable backups, a compromised web
-  session cannot alter history. (SQLite has no roles; separation of duties
-  inside the database is one reason to move to Postgres, ADR-009.)
+  combined with role separation the application credential cannot alter
+  history.
 * (+) Field-level granularity makes diffs, collapsing ("3 fields changed"),
   and per-field subscriptions trivial.
 * (+) `txn_id` makes bulk edits a single undo unit and a single webhook
   delivery per item.
 * (−) Volume: a bulk edit of 500 items × 3 fields is 1,500 rows. At firm scale
-  this is tens of millions of rows per year — fine for SQLite (the table is a
-  B-tree keyed by `id`), but plan the archive-database step in
-  05-operations.md §4 when the file passes ~50 GB.
+  this is tens of millions of rows per year — fine for Postgres, but plan
+  monthly partitioning past ~50 GB.
 * (−) Nothing outside `applyMutation` may write business tables, or the log
   is incomplete. Direct SQL fixes must be done through the API or logged by
   hand.

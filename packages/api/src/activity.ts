@@ -41,14 +41,12 @@ export interface EventRow extends Row {
   created_at: string;
 }
 
-/** old/new values are stored as JSON text (strings and numbers included) and come back parsed. */
-const jsonOrNull = (tx: Tx, v: unknown) => (v === undefined || v === null ? null : tx.json(v));
+const jsonOrNull = (tx: Tx, v: unknown) => (v === undefined || v === null ? null : tx.json(v as any));
 
 /** Append activity rows (one per field change). Returns the inserted rows with ids (the feed/webhook cursor). */
 export async function writeEvents(tx: Tx, actor: Actor | null, meta: MutationMeta, events: EventInput[]): Promise<EventRow[]> {
   const out: EventRow[] = [];
   for (const e of events) {
-    // activity_events has no row-modifying triggers, so RETURNING is complete (id is the autoincrement cursor).
     const [row] = await tx`
       insert into activity_events (txn_id, entity_type, entity_id, item_id, project_id, actor_kind, actor_id, actor_label, action, field, old_value, new_value, mutation_name, source)
       values (${meta.txnId}, ${e.entity_type}, ${e.entity_id}, ${e.item_id ?? null}, ${e.project_id ?? null}, ${meta.actorKind}, ${actor?.id ?? null},

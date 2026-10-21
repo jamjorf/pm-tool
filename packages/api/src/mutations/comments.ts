@@ -1,9 +1,9 @@
 import type { MutationArgsOf } from '@pm/core';
-import { nowIso, type Row } from '../db.js';
+import type { Row } from '../db.js';
 import { notFound, validation } from '../errors.js';
 import { extractMentions, permissions } from '../core-compat.js';
 import type { MutationCtx } from './context.js';
-import { assertItem, ensureWatcher, getItem, getProject, itemCtx, projectCtx, reload } from './helpers.js';
+import { assertItem, ensureWatcher, getItem, getProject, itemCtx, projectCtx } from './helpers.js';
 import { actorName, snippet, watcherIds } from './notify-helpers.js';
 
 const COMMENT_SOURCES = new Set(['app', 'api', 'mcp', 'slack', 'email', 'github']);
@@ -34,18 +34,18 @@ export async function addCommentInternal(
     parent = p;
   }
   const source = COMMENT_SOURCES.has(meta.source) ? meta.source : 'app';
-  await tx`
+  const [comment] = await tx`
     insert into comments (id, item_id, author_id, body, parent_id, source, external_ref)
-    values (${args.id}, ${item.id}, ${actor.id}, ${args.body}, ${parent?.id ?? null}, ${source}, ${args.external_ref ? tx.json(args.external_ref) : null})`;
-  const comment = await reload(tx, 'comments', args.id);
-  await ctx.emit([{ entity_type: 'comment', entity_id: comment.id, item_id: item.id, project_id: item.project_id, action: 'create', field: null, new_value: comment }]);
+    values (${args.id}, ${item.id}, ${actor.id}, ${args.body}, ${parent?.id ?? null}, ${source}, ${args.external_ref ? tx.json(args.external_ref as any) : null})
+    returning *`;
+  await ctx.emit([{ entity_type: 'comment', entity_id: comment!.id, item_id: item.id, project_id: item.project_id, action: 'create', field: null, new_value: comment }]);
 
   await ensureWatcher(ctx, item.id, actor.id, 'commenter');
   const who = await actorName(ctx);
   const notified = new Set<string>([actor.id]);
   for (const userId of extractMentions(args.body)) {
     if (notified.has(userId)) continue;
-    const [u] = await tx`select id from users where id = ${userId} and deleted_at is null and is_active = 1`;
+    const [u] = await tx`select id from users where id = ${userId} and deleted_at is null and is_active`;
     if (!u) continue;
     await ensureWatcher(ctx, item.id, userId, 'mention');
     ctx.notify({ user_id: userId, item_id: item.id, kind: 'mention', title: `${who} mentioned you in ${item.key}: ${item.title}`, body: snippet(args.body), event_id: ctx.events.at(-1)?.id });
@@ -60,7 +60,7 @@ export async function addCommentInternal(
     ctx.notify({ user_id: w, item_id: item.id, kind: 'comment', title: `${who} commented on ${item.key}: ${item.title}`, body: snippet(args.body) });
     notified.add(w);
   }
-  return comment;
+  return comment!;
 }
 
 export async function editComment(ctx: MutationCtx, args: MutationArgsOf<'editComment'>): Promise<Row> {
@@ -70,9 +70,9 @@ export async function editComment(ctx: MutationCtx, args: MutationArgsOf<'editCo
   const resource = { item: itemCtx(item, project), project: projectCtx(project), ownerId: comment.author_id };
   if (comment.author_id === ctx.actor.id) permissions.assert(ctx.actor, 'comment.edit_own', resource);
   else permissions.assert(ctx.actor, 'comment.edit_any', resource);
-  await ctx.tx`update comments set body = ${args.body}, edited_at = ${nowIso()} where id = ${comment.id}`;
+  const [after] = await ctx.tx`update comments set body = ${args.body}, edited_at = now() where id = ${comment.id} returning *`;
   await ctx.emit([{ entity_type: 'comment', entity_id: comment.id, item_id: item.id, project_id: item.project_id, action: 'update', field: 'body', old_value: comment.body, new_value: args.body }]);
-  return reload(ctx.tx, 'comments', comment.id);
+  return after!;
 }
 
 export async function deleteComment(ctx: MutationCtx, args: MutationArgsOf<'deleteComment'>): Promise<Row> {
@@ -82,7 +82,7 @@ export async function deleteComment(ctx: MutationCtx, args: MutationArgsOf<'dele
   const resource = { item: itemCtx(item, project), project: projectCtx(project), ownerId: comment.author_id };
   if (comment.author_id === ctx.actor.id) permissions.assert(ctx.actor, 'comment.edit_own', resource);
   else permissions.assert(ctx.actor, 'comment.delete_any', resource);
-  await ctx.tx`update comments set deleted_at = ${nowIso()} where id = ${comment.id}`;
+  const [after] = await ctx.tx`update comments set deleted_at = now() where id = ${comment.id} returning *`;
   await ctx.emit([{ entity_type: 'comment', entity_id: comment.id, item_id: item.id, project_id: item.project_id, action: 'delete', field: null, old_value: comment }]);
-  return reload(ctx.tx, 'comments', comment.id);
+  return after!;
 }

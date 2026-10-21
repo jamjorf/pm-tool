@@ -51,7 +51,7 @@ Soft-deleted rows are always excluded; archived rows (`archived_at is not null`)
 | `parent_id` | uuid | yes | derived from `relations` (`parent_of`) |
 | `is_blocked` | bool | yes | derived: has open blockers |
 | `search` | fts | no | full text; op `match` only |
-| `fields.<key>` | per `FieldDef.kind` | yes | JSON field; the compiler reads `json_extract(w.fields, '$.key')` (typed scalars, no cast needed) and encodes the bound value by kind; multi kinds use `exists (select 1 from json_each(w.fields, '$.key') …)` |
+| `fields.<key>` | per `FieldDef.kind` | yes | JSONB field; the compiler casts `w.fields->>'key'` to `numeric`, `boolean`, `date` or `timestamptz` by kind; multi kinds use `?|` / `?&` |
 
 ## Operators
 
@@ -64,7 +64,7 @@ Soft-deleted rows are always excluded; archived rows (`archived_at is not null`)
 | `is_null`, `not_null` | any | null test (no value) |
 | `is_empty`, `not_empty` | arrays, text | empty array, empty string or null |
 | `has`, `has_any`, `has_all` | arrays (`labels`, `multi_select` fields) | element membership |
-| `match` | `search` | FTS5 `MATCH` (words AND, `"phrase"`, `OR`, `NOT`, `prefix*`), bm25-ranked; the search route falls back to `LIKE` on key/title |
+| `match` | `search` | FTS with `websearch_to_tsquery`; trigram fallback on `title` |
 | `before`, `after` | date, datetime | strictly before / after; value may be a macro |
 | `within_days` | date, datetime | between `$today` and `$today + N` inclusive, N = value |
 
@@ -176,7 +176,7 @@ The outer `filter` scopes every widget; each widget ANDs its own filter with it.
 
 ## Server and client execution
 
-**Server.** `compileQuery(spec, ctx, opts)` returns `{ text, values, isAggregate }` over `work_items_v w`, as SQLite SQL with positional `?` placeholders. `labels` compiles to an `EXISTS` over `work_item_labels`; `search` with `match` compiles to a join on `w.id` against the FTS hit set `(select id, bm25(work_items_fts, 10.0, 5.0, 1.0) as rank from work_items_fts where work_items_fts match ?)`, deduplicated by id and ordered by `rank`, and the search route adds a `LIKE` fallback on key/title when FTS finds nothing. The permission scope is appended as an extra WHERE: `visibilityWhere(userId)` is `exists (select 1 from visible_items vi where vi.user_id = ? and vi.item_id = w.id)`. `group_by` yields an aggregate query used by board counts and `compileWidget()`; widget time buckets (`day`, `week` starting Monday, `month`) are computed in UTC with `strftime` on both executors.
+**Server.** `compileQuery(spec, ctx, opts)` returns `{ text, values, isAggregate }` over `work_items_v w`. `labels` compiles to an `EXISTS` over `work_item_labels`; `search` with `match` compiles to `w.search @@ websearch_to_tsquery('english', $n)` ordered by `ts_rank`, with a `title % $n` (pg_trgm) fallback when FTS finds nothing. The permission scope is appended as an extra WHERE (`visibilityWhere(userId)`), mirroring `can_view_item()`. `group_by` yields an aggregate query used by board counts and `compileWidget()`.
 
 **Client.** `runSpec(spec, items, ctx, lookups)` returns `{ items, groups }`. `lookups` carries the local `states`, `types`, `projects`, `labelIdsByItem`, `parentByItem` and `blockedItems`, so dotted refs resolve without joins. Everything on screen comes from `runSpec` over local rows; only deep search (`GET /api/v1/search`) and dashboards over data you have not synced go to the server.
 
