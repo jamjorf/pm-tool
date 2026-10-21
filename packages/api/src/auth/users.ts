@@ -9,11 +9,11 @@ export async function findOrCreateUser(sql: Sql, email: string, name?: string): 
   return withTxn(sql, async (tx) => {
     const again = await findUserByEmail(tx, email);
     if (again) return again;
-    const cnt = await tx`select count(*)::int as n from users where deleted_at is null and not is_service`;
-    const role = cnt[0]!.n === 0 ? 'owner' : 'member';
+    const cnt = await tx`select count(*) as n from users where deleted_at is null and is_service = 0`;
+    const role = Number(cnt[0]!.n) === 0 ? 'owner' : 'member';
     const displayName = name?.trim() || email.split('@')[0] || email;
-    const [u] = await tx`insert into users (email, name, firm_role) values (${email.trim()}, ${displayName}, ${role}) returning *`;
-    return u as UserRow;
+    await tx`insert into users (email, name, firm_role) values (${email.trim()}, ${displayName}, ${role})`;
+    return (await findUserByEmail(tx, email))!; // re-read: version is stamped by a trigger after insert
   });
 }
 

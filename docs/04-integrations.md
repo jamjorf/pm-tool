@@ -91,7 +91,7 @@ curl -s "${H[@]}" -X POST $API/api/v1/items/bulk -d '{"keys":["RATES-12","RATES-
 curl -s "${H[@]}" -X POST $API/api/v1/items/bulk-transition -d '{"keys":["RATES-12","RATES-13"],"transition_key":"complete"}'
 # → {"ok":["…"],"failed":[{"id":"…","failures":[{"guard":{"type":"children_in_category",…},"reason":"…"}]}]}
 
-# Search (FTS, trigram fallback)
+# Search (FTS5 with bm25 ranking; LIKE fallback for partial words)
 curl -s "${H[@]}" "$API/api/v1/search?q=curve+NaN&project=RATES&limit=20"
 
 # My work (what the MCP server and the palette use)

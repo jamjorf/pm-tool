@@ -1,6 +1,9 @@
 // ============================================================================
 // Client-side QuerySpec evaluator. Semantics mirror query/compile.ts exactly
-// (asserted by query/parity.test.ts against a real Postgres).
+// (asserted by query/parity.test.ts against an in-memory SQLite database with
+// the real migration applied). Rows are the shape @pm/db hydrates from
+// work_items_v: `fields` parsed, `label_names` an array, is_blocked/confidential
+// booleans, dates 'YYYY-MM-DD' text and timestamps ISO text.
 // ============================================================================
 import type { FilterExpr, QuerySpec, QueryContext, SortSpec, FieldRef, ValueMacro } from './spec.js';
 import { STATE_CATEGORY_ORDER } from './spec.js';

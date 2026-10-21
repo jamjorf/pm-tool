@@ -30,10 +30,10 @@ flowchart LR
         NOTIF[notification worker<br/>rules · collapse · digests · quiet hours]
         WH[webhook dispatcher<br/>every 5s · HMAC · backoff]
         INT[packages/integrations<br/>Slack · GitHub · email routes]
-        SEARCH[FTS + trigram]
+        SEARCH[FTS5 + bm25]
     end
 
-    PG[(Postgres 16<br/>one database)]
+    DB[(SQLite file<br/>data/pmtool.db · WAL)]
 
     RC -->|push| SYNC
     SYNC -->|pull patch · poke| RC
@@ -42,11 +42,11 @@ flowchart LR
     REST --> MUT
     SYNC --> MUT
     INT --> MUT
-    MUT --> PG
-    REST --> SEARCH --> PG
-    SYNC --> PG
-    NOTIF --> PG
-    WH --> PG
+    MUT --> DB
+    REST --> SEARCH --> DB
+    SYNC --> DB
+    NOTIF --> DB
+    WH --> DB
     WH -->|POST + X-PM-Signature| EXT[Your systems]
     NOTIF -->|sendSlackMessage / sendEmail| SL[Slack · SMTP]
     SLK[Slack events · slash · interactions] --> INT
@@ -54,20 +54,23 @@ flowchart LR
     EM[Inbound email JSON] --> INT
 ```
 
-The whole server is one process against one Postgres. There is no queue, no
-cache, no second service: the webhook dispatcher and the notification worker
-are loops inside the API process reading tables (`webhook_deliveries`,
-`notification_deliveries`). Poke fan-out is an in-process `EventEmitter`.
-This is deliberate — see [ADR-008](adr/ADR-008-monolith-single-region.md).
+The whole server is one process against one SQLite file, opened through
+Node's built-in `node:sqlite` by the `@pm/db` runtime. There is no database
+server, no queue, no cache, no second service: the webhook dispatcher and the
+notification worker are loops inside the API process reading tables
+(`webhook_deliveries`, `notification_deliveries`) and claiming rows in short
+write transactions. Poke fan-out is an in-process `EventEmitter`. This is
+deliberate — see [ADR-008](adr/ADR-008-monolith-single-region.md) and
+[ADR-009](adr/ADR-009-sqlite-over-postgres.md).
 
 ### 1.1 Packages and dependency direction
 
 | Package | Depends on | Runs in |
 |---|---|---|
 | `@pm/core` | zod | browser, Node, MCP (pure, no I/O) |
-| `@pm/db` | postgres | Node (migrate / seed) |
+| `@pm/db` | `node:sqlite` (built into Node 22.13+; no native module) | Node (runtime layer, migrate / seed / reset) |
 | `@pm/integrations` | `@pm/core` (+ fastify types, nodemailer) | inside `@pm/api` |
-| `@pm/api` | `@pm/core`, `@pm/integrations`, postgres, fastify | the server |
+| `@pm/api` | `@pm/core`, `@pm/db`, `@pm/integrations`, fastify | the server |
 | `@pm/web` | `@pm/core`, replicache, react | browser |
 | `@pm/mcp` | `@pm/core`, MCP SDK | agent host machine |
 
@@ -104,7 +107,7 @@ FieldRef   = /^[a-z_]+(\.[a-z0-9_]+)?$/
 | `state.category`, `state.key` | via `workflow_states` |
 | `type.key` | via `item_types` |
 | `project.key` | via `projects` |
-| `fields.<key>` | JSONB field; cast by the type's `FieldDef.kind` |
+| `fields.<key>` | JSON field read with `json_extract(w.fields, '$.<key>')`; typed by the type's `FieldDef.kind` |
 | `labels` | array of label ids; ops `has`, `has_any`, `has_all`, `is_empty`, `not_empty` |
 | `parent_id` | derived from `relations` (`parent_of`) |
 | `is_blocked` | derived: has open blockers |
@@ -121,7 +124,7 @@ FieldRef   = /^[a-z_]+(\.[a-z0-9_]+)?$/
 | `is_null`, `not_null` | any | null test (no value) |
 | `is_empty`, `not_empty` | arrays, text | empty array / empty string / null |
 | `has`, `has_any`, `has_all` | arrays (`labels`, `multi_select` fields) | element membership |
-| `match` | `search` | FTS; falls back to trigram on title |
+| `match` | `search` | FTS5 `MATCH`; the search route falls back to `LIKE` on key/title for partial words |
 | `before`, `after` | date / datetime | strictly before/after; value may be a macro |
 | `within_days` | date / datetime | between `$today` and `$today + N days` inclusive (N = value) |
 
@@ -137,24 +140,36 @@ both executors must give identical answers for every fixture case.
 
 ```ts
 compileQuery(spec: QuerySpec, ctx: QueryContext, opts: CompileOptions): CompiledQuery
-// CompiledQuery = { text: string; values: unknown[]; isAggregate: boolean }
+// CompiledQuery = { text: string; values: unknown[]; isAggregate: boolean }   // text uses `?` placeholders, values in order
 // CompileOptions = { from?: string; fieldDefs?: Record<typeKey, FieldDef[]>; extraWhere?: {text, values}[]; select?: string }
 ```
 
+* The output is SQLite SQL with positional `?` placeholders; `values` are
+  bound in order by the `@pm/db` `sql` tag (`sql.unsafe(text, values)`).
+  Booleans are bound as 0/1, arrays and objects as JSON text.
 * Base relation is `work_items_v w` (all `work_items` columns plus `type_key`,
   `type_name`, `state_key`, `state_name`, `state_category`, `project_key`,
-  `project_name`, `assignee_name`, `label_names`, `parent_id`, `is_blocked`).
-* `fields.<key>` compiles to `w.fields->>'key'` with a cast chosen from the
-  field kind (`::numeric`, `::date`, `::timestamptz`, `::boolean`; multi
-  kinds compile against `w.fields->'key'` with `?|` / `?&`).
+  `project_name`, `assignee_name`, `label_names` (JSON array), `parent_id`,
+  `is_blocked` (0/1)).
+* `fields.<key>` compiles to `json_extract(w.fields, '$.<key>')`; SQLite's
+  JSON functions return typed scalars, so numbers compare as numbers and the
+  field kind only decides how the bound value is encoded (`date`/`datetime`
+  as text, `bool` as JSON `true`/`false`). Multi kinds (`has`, `has_any`,
+  `has_all`) compile to `exists (select 1 from json_each(w.fields, '$.<key>') e where e.value …)`.
 * `labels` compiles to `EXISTS (select 1 from work_item_labels …)`.
-* `search` with `match` compiles to `w.search @@ websearch_to_tsquery('english', $n)`
-  ordered by `ts_rank`, and the route falls back to `w.title % $n` (pg_trgm)
-  when FTS returns nothing.
+* `search` with `match` compiles to
+  `w.id in (select id from work_items_fts where work_items_fts match ?)` and,
+  when it is the first `search` leaf, orders by
+  `bm25(work_items_fts, 10.0, 5.0, 1.0)`. The `/api/v1/search` route adds a
+  `LIKE` fallback on `key`/`title` when FTS returns nothing (partial words).
 * The permission scope is appended as an extra WHERE from
-  `visibilityWhere(userId, paramOffset)`, which mirrors `can_view_item()`.
+  `visibilityWhere(userId)`, which is exactly
+  `exists (select 1 from visible_items vi where vi.user_id = ? and vi.item_id = w.id)`.
 * `group_by` produces an aggregate query (`isAggregate = true`) used by
-  boards' column counts and by `compileWidget()`.
+  boards' column counts and by `compileWidget()`. Widget `time_bucket`s are
+  computed in UTC with `strftime`: `day` → `%Y-%m-%d`, `month` → `%Y-%m-01`,
+  `week` → the Monday of the ISO week; the client evaluator buckets the same
+  way, so both executors agree.
 * Soft-deleted rows are always excluded; `archived_at is not null` rows are
   excluded unless `include_archived`.
 
@@ -169,8 +184,9 @@ runSpec(spec, items: ItemRow[], ctx, lookups: EvalLookups)
 exposes; `EvalLookups` carries the local `states`, `types`, `projects`,
 `labelIdsByItem`, `parentByItem`, `blockedItems` so dotted refs resolve
 without joins. `matchesFilter` is the client-side twin of the SQL compiler;
-the core test suite loads one fixture set into Postgres and into memory and
-asserts that `compileQuery` and `runSpec` return the same ids for every spec.
+the core test suite loads one fixture set into an in-memory SQLite database
+(`openDb(':memory:')` + the migration) and into plain objects, and asserts
+that `compileQuery` and `runSpec` return the same ids for every spec.
 Everything on screen comes from `runSpec` over local rows; only deep search
 (`/api/v1/search`) and dashboards over data you have not synced go to the
 server.
@@ -286,7 +302,7 @@ mutators (optimistic) → `POST /sync/push` (authoritative replay), REST routes
 | Mutation | Rows written | Activity rows (`entity_type` / `action` / `field`) | Side effects |
 |---|---|---|---|
 | `createItem` | `work_items` (state defaults to workflow initial), `work_item_labels`, `relations(parent_of)` if `parent_id` | `work_item/create` + one `update`-style row per non-default field is an implementation detail; minimum is the `create` row | watchers: reporter/assignee; `assigned`/`mention` notifications; `item.created` webhook |
-| `updateItem` | `work_items` (patch; `fields` shallow-merged) | one row per changed tracked field; JSONB keys as `fields.<key>` | watchers (assignee/mention); `assigned`, `mention` notifications; `item.updated` webhook; resync if `confidential` changed |
+| `updateItem` | `work_items` (patch; `fields` shallow-merged) | one row per changed tracked field; JSON keys as `fields.<key>` | watchers (assignee/mention); `assigned`, `mention` notifications; `item.updated` webhook; resync if `confidential` changed |
 | `bulkUpdateItems` | same as `updateItem` × ≤500 ids | all rows share one `txn_id` | same, per item |
 | `transitionItem` | `work_items.state_id` + `set_field` effect patch; labels via effects | `work_item/transition/state_id` + one row per effect-set field | `notify`, `webhook`, `transition_parent_if`, `transition_children` effects; `state_change` notifications; `item.transitioned` (+ `item.completed` when the effect names it) |
 | `bulkTransitionItems` | per item, each evaluated independently | one `txn_id` | returns `{ok:[], failed:[{id, failures}]}` |
@@ -321,8 +337,13 @@ Common `applyMutation` pipeline for every mutation (ARCHITECTURE.md §Mutations)
 7. Enqueue `webhook_deliveries` for matching endpoints.
 8. Set `sync_client_groups.resync_required` when visibility may have changed.
 
-Every transaction that touches a synced table begins with
-`select pg_advisory_xact_lock(42)`.
+Every transaction that touches a synced table runs inside `sql.begin()` from
+`@pm/db`, which issues `BEGIN IMMEDIATE`: SQLite hands the one write lock to
+that transaction until it commits, so writers are serialised and the `version`
+stamps drawn from `sync_state` commit in order. No advisory lock is needed.
+Never hold such a transaction across network I/O (webhook POSTs, SMTP, Slack):
+the dispatcher and notification workers claim rows in one short transaction,
+do the I/O outside it, and record the outcome in another.
 
 `meta = { source, txnId, mutationName, actorKind, actorLabel }` is what ends
 up in `activity_events.source / txn_id / mutation_name / actor_kind /
@@ -345,10 +366,11 @@ evaluate(def, item, transitionKey, ctx) → TransitionResult {
 Server sequence for `transitionItem`:
 
 1. Load the item, its type's workflow definition (states + non-deleted
-   transitions), the actor's `effective_project_role`.
-2. Load `GuardContext`: `openBlockerCount = count(item_open_blockers(id))`,
-   `childrenCategories` from direct `parent_of` children's states,
-   `labelNames` from `work_item_labels`.
+   transitions), the actor's role from `effective_roles`.
+2. Load `GuardContext`: `openBlockerCount` =
+   `select count(*) from open_blockers where item_id = ?`,
+   `childrenCategories` from direct `parent_of` children's states
+   (`item_parents`), `labelNames` from `work_item_labels`.
 3. `evaluate()`. If `!ok` → HTTP 409 `guard_failed` with `failures`; in a sync
    push the mutation is marked applied and a `mutation_rejected` notification
    is written for the actor.
@@ -360,7 +382,7 @@ Server sequence for `transitionItem`:
    * `add_label` / `remove_label` → by label name within the project (then firm-wide);
    * `transition_parent_if` → if the parent exists and all its direct children's categories ∈ `all_children_category`, run the parent's transition that leads to state key `to` (recursively, same `txn_id`, as `system` actor kind with the original actor id);
    * `transition_children` → run the named transition on every direct child; a child whose guards fail is skipped and reported, it does not abort the parent (implementation detail).
-6. Recursion is bounded by the hierarchy depth (`item_descendants` caps at 100).
+6. Recursion is bounded by the hierarchy depth (`item_ancestry` caps at 100).
 
 Client sequence (optimistic): the mutator calls `evaluate()` with a
 best-effort context (`openBlockerCount` from local `relations` + states,
@@ -377,9 +399,9 @@ unknown states, with duplicate keys, or with unreachable states.
 | Point | Mechanism |
 |---|---|
 | Every REST write and every push mutation | `permissions.assert(actor, action, resource)` in `applyMutation` before any SQL; failure → 403 `forbidden` |
-| Every REST read of items | `visibilityWhere(userId)` appended by the query compiler; `GET /items/:key` → `can_view_item()` |
+| Every REST read of items | `visibilityWhere(userId)` appended by the query compiler; `GET /items/:key` → `exists (select 1 from visible_items where user_id = ? and item_id = ?)` |
 | `GET /api/v1/activity`, `/export/items.csv`, `/search` | same visibility predicate |
-| Sync pull | per-table visibility rules (ARCHITECTURE.md §Sync): `can_view_item()` for items, `visible_project_ids()` for projects/members, parent-item visibility for comments/relations/labels/watchers, owner-or-shared for views, own rows for notifications/preferences |
+| Sync pull | per-table visibility rules (ARCHITECTURE.md §Sync): `visible_items` for items, `effective_roles` for projects/members, parent-item visibility for comments/relations/labels/watchers, owner-or-shared for views, own rows for notifications/preferences |
 | Visibility changes | `resync_required` → next pull sends `clear` + full snapshot, so a client never keeps rows it may no longer see |
 | UI | `permissions.can()` with the actor from `/me` hides or disables actions; it is a convenience, never the authority |
 | Workflow guards | `require_role` evaluated with the same effective role |
@@ -394,52 +416,68 @@ unknown states, with duplicate keys, or with unreachable states.
 sequenceDiagram
     participant C as Client (Replicache)
     participant S as API
-    participant DB as Postgres
+    participant DB as SQLite (WAL)
     C->>S: POST /sync/push {clientGroupID, mutations:[{id, clientID, name, args}]}
     loop each mutation (own transaction)
-        S->>DB: select pg_advisory_xact_lock(42)
+        S->>DB: BEGIN IMMEDIATE (sql.begin: the single write lock)
         S->>DB: read sync_clients.last_mutation_id
         alt id <= last
             S-->>S: skip (already applied)
         else id == last + 1
             S->>DB: applyMutation(...) (errors → mutation_rejected notification, still marked applied)
-            S->>DB: last_mutation_id = id, version = nextval('sync_version_seq')
+            S->>DB: last_mutation_id = id, version = sql.nextVersion() (sync_state.version + 1)
         else id > last + 1
             S-->>C: error (gap)
         end
+        S->>DB: COMMIT
     end
     S-->>C: 200
     S-->>C: SSE event: poke
     C->>S: POST /sync/pull {clientGroupID, cookie}
-    S->>DB: rows with version > cookie, per table, visibility-filtered
-    S-->>C: {cookie: max version, lastMutationIDChanges, patch:[put|del|clear]}
+    S->>DB: BEGIN DEFERRED (sql.snapshot): read sync_state.version, then rows with version > cookie per table, visibility-filtered
+    S-->>C: {cookie: sync_state.version, lastMutationIDChanges, patch:[put|del|clear]}
 ```
 
-* **Push**: per mutation, in one transaction holding the advisory lock:
-  idempotent on `mutation.id`, strict ordering (`> last + 1` is an error),
-  errors inside a mutation are logged, the mutation is still marked applied
-  (Replicache semantics — the optimistic change is rolled back on the next
-  pull), and a `notifications` row of kind `mutation_rejected` tells the user
-  why. After the push, poke.
-* **Pull**: `cookie` = last `version` seen (null → 0). If the cookie is
-  null/0 or the client group has `resync_required`, respond with
-  `{op:'clear'}` followed by `put` of every visible row and clear the flag.
-  Otherwise for each table in `SYNCED_TABLES` select `version > cookie` and
-  emit `put` when the row is visible and `deleted_at is null`, else `del`.
+* **Push**: per mutation, in one `BEGIN IMMEDIATE` transaction: idempotent on
+  `mutation.id`, strict ordering (`> last + 1` is an error), errors inside a
+  mutation are logged, the mutation is still marked applied (Replicache
+  semantics — the optimistic change is rolled back on the next pull), and a
+  `notifications` row of kind `mutation_rejected` tells the user why. After
+  the push, poke.
+* **Pull**: `cookie` = last `version` seen (null → 0). The whole pull runs in
+  one deferred read transaction (`sql.snapshot`), which under WAL is a
+  consistent snapshot that never blocks the writer. The server reads
+  `sync_state.version` inside that snapshot and returns it as the new cookie.
+  If the cookie is null/0 or the client group has `resync_required`, respond
+  with `{op:'clear'}` followed by `put` of every visible row and clear the
+  flag. Otherwise for each table in `SYNCED_TABLES` select `version > cookie`
+  and emit `put` when the row is visible and `deleted_at is null`, else `del`.
   The KV key is `rowKey(table, row)` = `"<table>/<pk1>[/<pk2>]"`.
 * **Poke**: `GET /sync/poke` is SSE; the server emits `event: poke` after any
   committed push or REST write; clients call `replicache.pull()`.
 
-### 6.2 Global version strategy and the advisory lock
+### 6.2 Global version strategy and write serialisation
 
-Every synced row gets `version = nextval('sync_version_seq')` on insert/update
-(trigger). A pull is "rows with `version > cookie`". That is only correct if
-*version order equals commit order*: without the lock, transaction A could take
-version 100, transaction B version 101 and commit first, a client could pull
-`cookie = 101`, and A's row (100) would never be sent. Taking
-`pg_advisory_xact_lock(42)` at the start of every writing transaction
-serialises writers, so versions commit in order. The cost is one writer at a
-time; at a firm's scale (tens of writes per second at peak) this is invisible.
+Every synced row gets its `version` from the one-row `sync_state` table on
+insert/update: the `<table>_version_ins`/`_upd` triggers do
+`update sync_state set version = version + 1` and stamp the row with the new
+value. A pull is "rows with `version > cookie`". That is only correct if
+*version order equals commit order*: if transaction A could take version 100,
+transaction B version 101 and commit first, a client could pull `cookie = 101`
+and A's row (100) would never be sent. SQLite makes this hold by construction:
+a writing transaction opened with `BEGIN IMMEDIATE` owns the database's single
+write lock until it commits or rolls back, so no second writer can draw a
+version in between. The `@pm/db` runtime adds an async mutex in front of that
+lock so that, inside one process, waiting transactions queue instead of
+spinning on `SQLITE_BUSY` (`busy_timeout` is 5 s as a backstop). No advisory
+lock, no sequence. The cost is one writer at a time, which is also SQLite's
+cost; at a firm's scale (tens of writes per second at peak) this is invisible.
+
+The pull side reads inside a deferred transaction. Under WAL a reader sees the
+database as of the last commit before it started and is never blocked by the
+writer; `sync_state.version` read in that snapshot is therefore exactly "the
+highest version that can appear in this patch", which is what the cookie must
+mean.
 
 ### 6.3 Tombstones and visibility
 
@@ -460,55 +498,60 @@ cannot be expressed as per-row `del`s cheaply, so they set
   exactly "the server owns the write and the client is optimistic"; the shape
   of the sync is ours, the protocol is a stable, documented JSON contract with
   no sidecar.
-* ElectricSQL/PowerSync replicate the database to the client (great for
-  reads) but writes still need a custom path, and their shape/permission
-  rules would duplicate `can_view_item()`.
+* ElectricSQL/PowerSync replicate a Postgres database to the client (great for
+  reads) but writes still need a custom path, their shape/permission rules
+  would duplicate `visible_items`, and they require a Postgres server.
 * Zero is attractive for query-driven sync, but at this size the whole visible
   dataset fits in IndexedDB; full-row sync with a single cookie is simpler to
   reason about and to audit.
-* All three add an infrastructure component (a sync service, a Postgres
-  logical-replication consumer). The design goal is one process + Postgres.
+* All three add an infrastructure component (a sync service, a replication
+  consumer, a database server). The design goal is one process + one file.
 
 ### 6.5 Limits and when to move to row-versioning
 
 | Symptom | Threshold (rule of thumb) | Move |
 |---|---|---|
 | Initial snapshot too large | > ~200k visible rows per user or > ~50 MB | Per-table snapshot paging; archive old items (`archived_at`) and exclude archived rows from the snapshot |
-| Lock contention | sustained > ~50 writes/s, p95 push latency > 500 ms | Replicache "row versioning" strategy: track per-client-group which rows (key → version) were sent (a `client_view_records` table), drop the global sequence and the advisory lock, compute diffs per client group |
+| Writer contention | sustained > ~50 writes/s, p95 push latency > 500 ms | Replicache "row versioning" strategy: track per-client-group which rows (key → version) were sent (a `client_view_records` table), drop the global counter, compute diffs per client group. Serialised writers are a property of SQLite, so this move alone does not remove them; see the next row |
 | Frequent resyncs | membership churn causing full snapshots many times a day | Same as above; row-versioning makes visibility changes incremental |
-| Multi-process | second API instance | Poke must leave the in-memory emitter (Postgres `LISTEN/NOTIFY` is enough); the advisory lock still works across processes on one database |
+| Multi-process or multi-host | second API instance, or writers on more than one machine | Move the file to Postgres ([ADR-009](adr/ADR-009-sqlite-over-postgres.md) describes the mechanical path), then poke via `LISTEN/NOTIFY` and an advisory lock (or row versioning) for the version order. SQLite does serialise writers across processes on one host, but the poke emitter, the worker loops and the single-file backup story assume one process |
 
 The client protocol does not change in any of these moves; only the server's
 `pull` implementation does.
 
 ## 7. Search
 
-* **Default: Postgres FTS.** `work_items.search` is a generated, stored
-  `tsvector` weighting `key` and `title` as A and `description` as C, GIN
-  indexed. Queries use `websearch_to_tsquery('english', q)` (supports quoted
-  phrases, `-exclusion`, `or`), ranked with `ts_rank`.
-* **Typo tolerance: trigram.** `work_items_title_trgm_idx` (`gin_trgm_ops`)
-  backs the fallback `title % q` when FTS returns nothing, and the command
-  palette's fuzzy title matching.
+* **Default: SQLite FTS5.** `work_items_fts` is an FTS5 virtual table over
+  `key`, `title` and `description` with the `porter unicode61` tokenizer
+  (case and diacritic folding, English stemming), kept in sync by three
+  triggers on `work_items`. Queries use `work_items_fts match ?` (FTS5
+  syntax: implicit AND, `"quoted phrase"`, `OR`, `NOT`, trailing `*` for a
+  prefix), ranked with `bm25(work_items_fts, 10.0, 5.0, 1.0)` so a hit in the
+  key outweighs the title, which outweighs the description; `snippet()`
+  supplies the highlighted excerpt.
+* **Partial words: `LIKE` fallback.** FTS5 matches whole tokens, so when a
+  query returns nothing the search route retries with
+  `w.key like '%' || ? || '%' or w.title like '%' || ? || '%'` (SQLite's
+  `LIKE` is case-insensitive for ASCII), ordered by `updated_at`. This covers
+  "curv" for "curve" and typing a key fragment; it is not typo tolerance.
 * **Instant: local.** The palette and views search the local store with
   `contains`/`starts_with` on `key`/`title` — zero latency, no server.
 * `GET /api/v1/search?q=&project=&limit` returns `{items:[{...item, rank,
-  snippet}]}`, visibility-filtered. `fields` text is not in the tsvector; add a
-  `fields.<key>` filter alongside `search` when you need both.
+  snippet}]}`, visibility-filtered. `fields` text is not in the FTS table; add
+  a `fields.<key>` filter alongside `search` when you need both.
 
 **"Until it isn't"** — the line is crossed when any of these holds:
 
 1. Users need relevance across comments, attachments and `fields` text with
-   per-field boosting (the tsvector would need to be a trigger-maintained
-   column over three tables);
-2. Non-English content or language detection matters;
-3. Search latency over ~1M items exceeds ~200 ms p95 despite the GIN index;
-4. Semantic/"find similar" queries are requested.
+   per-field boosting (the FTS table would need to be trigger-maintained over
+   three tables);
+2. Non-English content or language detection matters (FTS5 ships one stemmer);
+3. Search latency over ~1M items exceeds ~200 ms p95;
+4. Semantic/"find similar" queries or real typo tolerance are requested.
 
-Then: Meilisearch or Typesense (1–3; index fed from `activity_events` by
-cursor, so indexing is incremental and replayable), `pgvector` in the same
-Postgres for (4). The `search` FieldRef keeps its meaning; only the executor
-changes.
+Then: Meilisearch or Typesense (1–4; index fed from `activity_events` by
+cursor, so indexing is incremental and replayable). The `search` FieldRef
+keeps its meaning; only the executor changes.
 
 ## 8. Notifications
 
@@ -631,7 +674,7 @@ sequenceDiagram
     participant R as Replicache
     participant API as API /sync/push
     participant M as applyMutation
-    participant DB as Postgres
+    participant DB as SQLite
     participant P as /sync/poke (SSE)
     participant W as Webhook dispatcher
     participant N as Notification worker
@@ -643,11 +686,11 @@ sequenceDiagram
     R->>R: evaluate() with local GuardContext → patch {state_id, start_date}, optimistic put work_items/…
     B-->>U: card is already in the new column (0 ms)
     R->>API: POST /sync/push {mutations:[{id: 57, name:'transitionItem', args}]}
-    API->>DB: BEGIN, select pg_advisory_xact_lock(42), check last_mutation_id = 56
+    API->>DB: BEGIN IMMEDIATE (write lock), check last_mutation_id = 56
     API->>M: applyMutation(tx, actor, transitionItem, {source:'app', txnId})
-    M->>DB: permissions.assert(item.transition), load item + workflow + item_open_blockers()
+    M->>DB: permissions.assert(item.transition), load item + workflow + open_blockers
     M->>M: workflowEngine.evaluate → ok, patch, deferredEffects
-    M->>DB: update work_items set state_id, start_date (version = nextval)
+    M->>DB: update work_items set state_id, start_date (trigger stamps version from sync_state)
     M->>DB: insert activity_events ×2 (state_id, start_date) same txn_id
     M->>DB: upsert item_watchers; insert notifications (state_change → assignee if not actor)
     M->>DB: insert webhook_deliveries for endpoints matching item.transitioned
@@ -656,8 +699,8 @@ sequenceDiagram
     P-->>R: event poke
     R->>API: POST /sync/pull {cookie}
     API-->>R: patch with put work_items/…, put notifications/…
-    W->>DB: every 5s: pending deliveries
-    W->>EXT: POST https://your-system/hook  X-PM-Signature: sha256=…
+    W->>DB: every 5s: claim pending deliveries in a short transaction
+    W->>EXT: POST https://your-system/hook  X-PM-Signature: sha256=… (outside any transaction)
     N->>DB: notification_deliveries due (cadence immediate, outside quiet hours)
     N->>S: sendSlackMessage(renderNotification(n).slackBlocks)
     S-->>U: "Alice moved RATES-12 to In Progress" with transition buttons

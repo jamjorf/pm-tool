@@ -183,7 +183,26 @@ export function withinDaysBounds(kind: 'date' | 'datetime', n: number, ctx: Quer
   return { start: startOfDayInTz(a, tz), end: startOfDayInTz(addDays(b, 1), tz) };
 }
 
-/** Escape a value for use inside a LIKE/ILIKE pattern (default backslash escape). */
+export type TimeBucket = 'day' | 'week' | 'month';
+
+/**
+ * Calendar bucket of a date ('YYYY-MM-DD') or ISO timestamp, computed on the UTC
+ * calendar date (the first 10 characters) exactly like the SQL compiler's
+ * time_bucket: day → the date, week → its Monday, month → its first day.
+ * Returns null for null/undefined or non-date input.
+ */
+export function timeBucket(value: unknown, bucket: TimeBucket): string | null {
+  if (value === null || value === undefined) return null;
+  const day = (value instanceof Date ? value.toISOString() : String(value)).slice(0, 10);
+  if (!DATE_ONLY_RE.test(day)) return null;
+  switch (bucket) {
+    case 'day': return day;
+    case 'month': return `${day.slice(0, 7)}-01`;
+    case 'week': return addDays(day, -isoWeekday(day));
+  }
+}
+
+/** Escape a value for use inside a LIKE pattern (backslash escape; emit `escape '\'`). */
 export function escapeLike(s: string): string {
   return s.replace(/[\\%_]/g, (c) => `\\${c}`);
 }

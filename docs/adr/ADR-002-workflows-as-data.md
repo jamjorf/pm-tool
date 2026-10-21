@@ -14,9 +14,9 @@ workflow a code change and makes the rules invisible to compliance.
 Three tables define state machines: `workflows`, `workflow_states` (with a
 closed `category` enum: backlog / todo / in_progress / done / canceled, a
 unique initial state) and `workflow_transitions` (`from_state_id` null = any,
-`to_state_id`, `guards jsonb[]`, `effects jsonb[]`). Each `item_type` points at
-one workflow. The database trigger `trg_validate_item_state` guarantees an
-item's state belongs to its type's workflow.
+`to_state_id`, `guards` and `effects` as JSON arrays). Each `item_type` points
+at one workflow. The database triggers `work_items_validate_state_ins`/`_upd`
+guarantee an item's state belongs to its type's workflow.
 
 Guards and effects are a closed, typed vocabulary (zod discriminated unions
 in `@pm/core`): guards `require_field`, `field_equals`, `field_in`,

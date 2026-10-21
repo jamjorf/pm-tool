@@ -122,7 +122,7 @@ export interface QueryContext {
 /** Result of compiling a QuerySpec to SQL (server side). */
 export interface CompiledQuery {
   text: string;            // SELECT ... FROM work_items_v w ... WHERE ... ORDER BY ... LIMIT ...
-  values: unknown[];       // positional params ($1..$n)
+  values: unknown[];       // positional `?` params, in order (plain SQLite scalars)
   /** For group_by queries: SELECT <group>, count(*), ... */
   isAggregate: boolean;
 }

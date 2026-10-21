@@ -14,7 +14,8 @@ cheap and must stay correct as desks add new kinds of relation.
 
 A single `relations` table: `type → relation_types(key)`, `from_item_id`,
 `to_item_id` (nullable), and for external entities `external_kind` +
-`external_ref jsonb` with a generated `external_key` for idempotent linking.
+`external_ref` (JSON text) with a generated `external_key` for idempotent
+linking.
 `relation_types` is a registry with flags `is_hierarchy`, `is_blocking`,
 `is_symmetric`; seeded with `parent_of`, `blocks`, `duplicates`,
 `relates_to`, `links_to`.

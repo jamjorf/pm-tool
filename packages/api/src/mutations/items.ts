@@ -1,12 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import type { Effect, GuardContext, ItemPatch, MutationArgsOf, TransitionResult, WorkItem, WorkflowDefinition } from '@pm/core';
-import type { Row } from '../db.js';
+import { nowIso, setOf, type Row } from '../db.js';
 import { ApiError, guardFailed, notFound, validation } from '../errors.js';
 import { diffItem, extractMentions, permissions, validateFields, workflowEngine } from '../core-compat.js';
 import type { MutationCtx } from './context.js';
 import {
   ITEM_COLUMNS, assertCan, assertItem, canViewItem, ensureWatcher, getItem, getProject, getType, getWorkflowDef, itemSnapshot,
-  labelIdsOf, labelNamesOf, parentIdOf, projectCtx, stripSearch, touchItem, touchItemChildren, type ItemRow,
+  labelIdsOf, labelNamesOf, parentIdOf, projectCtx, reload, stripSearch, touchItem, touchItemChildren, type ItemRow,
 } from './helpers.js';
 import { addCommentInternal } from './comments.js';
 import { setParentInternal } from './relations.js';
@@ -37,12 +37,12 @@ export async function createItem(ctx: MutationCtx, args: MutationArgsOf<'createI
   const fv = validateFields(type.field_defs, args.fields ?? {});
   if (!fv.ok) throw validation('invalid fields', fv.errors);
 
-  const [row] = await tx`
+  // number/key/version are assigned by AFTER INSERT triggers, so re-read instead of trusting RETURNING.
+  await tx`
     insert into work_items (id, project_id, type_id, title, description, state_id, priority, assignee_id, reporter_id, start_date, due_date, estimate, fields, confidential, created_by)
     values (${args.id}, ${project.id}, ${type.id}, ${args.title}, ${args.description ?? ''}, ${stateId}, ${args.priority ?? 0}, ${args.assignee_id ?? null},
-            ${actor.id}, ${args.start_date ?? null}, ${args.due_date ?? null}, ${args.estimate ?? null}, ${tx.json(fv.value as any)}, ${args.confidential ?? false}, ${actor.id})
-    returning *`;
-  const item = stripSearch(row!) as ItemRow;
+            ${actor.id}, ${args.start_date ?? null}, ${args.due_date ?? null}, ${args.estimate ?? null}, ${tx.json(fv.value)}, ${args.confidential ?? false}, ${actor.id})`;
+  const item = await getItem(tx, args.id);
 
   for (const labelId of args.label_ids ?? []) await attachLabel(ctx, item, labelId);
   if (args.parent_id) await setParentInternal(ctx, item, args.parent_id, { silent: true });
@@ -64,7 +64,7 @@ async function notifyMentions(ctx: MutationCtx, item: Row, text: string | null |
   const prev = new Set(previouslyMentioned);
   for (const userId of extractMentions(text)) {
     if (prev.has(userId) || userId === ctx.actor.id) continue;
-    const [u] = await ctx.tx`select id from users where id = ${userId} and deleted_at is null and is_active`;
+    const [u] = await ctx.tx`select id from users where id = ${userId} and deleted_at is null and is_active = 1`;
     if (!u) continue;
     await ensureWatcher(ctx, item.id, userId, 'mention');
     ctx.notify({ user_id: userId, item_id: item.id, kind: 'mention', title: `${await actorName(ctx)} mentioned you in ${item.key}: ${item.title}`, body: snippet(text) });
@@ -86,7 +86,7 @@ export async function bulkUpdateItems(ctx: MutationCtx, args: MutationArgsOf<'bu
 }
 
 export async function patchItem(ctx: MutationCtx, before: ItemRow, patch: ItemPatch): Promise<Row> {
-  const { tx, actor } = ctx;
+  const { tx } = ctx;
   const project = await assertItem(ctx, 'item.edit', before);
   const updates: Record<string, unknown> = {};
   let type = await getType(tx, before.type_id);
@@ -112,7 +112,7 @@ export async function patchItem(ctx: MutationCtx, before: ItemRow, patch: ItemPa
     for (const k of Object.keys(cleaned)) if (cleaned[k] === null || cleaned[k] === undefined) delete cleaned[k];
     const fv = validateFields(type.field_defs, cleaned);
     if (!fv.ok) throw validation('invalid fields', fv.errors);
-    updates.fields = tx.json(fv.value as any);
+    updates.fields = tx.json(fv.value);
   }
   for (const k of PATCH_COLUMNS) if (patch[k] !== undefined) updates[k] = patch[k];
   if (updates.assignee_id) {
@@ -121,14 +121,15 @@ export async function patchItem(ctx: MutationCtx, before: ItemRow, patch: ItemPa
   }
 
   if (!Object.keys(updates).length) return itemSnapshot(tx, before.id);
-  const [afterRow] = await tx`update work_items set ${tx(updates as any)} where id = ${before.id} returning *`;
+  // RETURNING reflects the statement's own writes (enough for the diff); version/updated_at are stamped by the trigger afterwards.
+  const [afterRow] = await tx`update work_items set ${setOf(tx, updates)} where id = ${before.id} returning *`;
   const after = stripSearch(afterRow!) as ItemRow;
   await recordItemDiff(ctx, before, after, 'update');
   await afterItemChange(ctx, before, after);
   return itemSnapshot(tx, before.id);
 }
 
-/** One activity row per changed field (fields.<key> for JSONB), all sharing the mutation txn_id. */
+/** One activity row per changed field (fields.<key> for JSON fields), all sharing the mutation txn_id. */
 async function recordItemDiff(ctx: MutationCtx, before: Row, after: Row, action: 'update' | 'transition') {
   const changes = diffItem(before as Partial<WorkItem>, after as Partial<WorkItem>);
   return ctx.emit(
@@ -170,7 +171,7 @@ async function notifyStateChange(ctx: MutationCtx, item: Row, stateName: string)
 // transitions
 // ---------------------------------------------------------------------------
 export async function loadGuardContext(ctx: { tx: MutationCtx['tx']; actor: MutationCtx['actor'] }, item: Row, project: Row): Promise<GuardContext> {
-  const n = (await ctx.tx`select count(*)::int as n from item_open_blockers(${item.id})`)[0]!.n as number;
+  const n = Number((await ctx.tx`select count(*) as n from open_blockers where item_id = ${item.id}`)[0]!.n);
   const cats = await ctx.tx`
     select s.category from relations r
     join work_items c on c.id = r.to_item_id and c.deleted_at is null
@@ -231,11 +232,11 @@ export async function transition(ctx: MutationCtx, item: ItemRow, transitionKey:
 
   const updates: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(result.patch)) {
-    if (k === 'fields') updates.fields = tx.json({ ...(item.fields ?? {}), ...((v as Record<string, unknown>) ?? {}) } as any);
+    if (k === 'fields') updates.fields = tx.json({ ...(item.fields ?? {}), ...((v as Record<string, unknown>) ?? {}) });
     else if (ITEM_COLUMNS.has(k)) updates[k] = resolveMacro(v, ctx);
   }
   updates.state_id = result.toState.id;
-  const [afterRow] = await tx`update work_items set ${tx(updates as any)} where id = ${item.id} returning *`;
+  const [afterRow] = await tx`update work_items set ${setOf(tx, updates)} where id = ${item.id} returning *`;
   const after = stripSearch(afterRow!) as ItemRow;
 
   await recordItemDiff(ctx, item, after, 'transition');
@@ -332,10 +333,10 @@ async function transitionToStateKey(ctx: MutationCtx, itemId: string, stateKey: 
 export async function deleteItem(ctx: MutationCtx, args: MutationArgsOf<'deleteItem'>): Promise<Row> {
   const item = await getItem(ctx.tx, args.id);
   await assertItem(ctx, 'item.delete', item);
-  const [after] = await ctx.tx`update work_items set deleted_at = now() where id = ${item.id} returning *`;
+  await ctx.tx`update work_items set deleted_at = ${nowIso()} where id = ${item.id}`;
   await touchItemChildren(ctx.tx, item.id);
   await ctx.emit([{ entity_type: 'work_item', entity_id: item.id, item_id: item.id, project_id: item.project_id, action: 'delete', field: null, old_value: item, new_value: null }]);
-  return stripSearch(after!);
+  return getItem(ctx.tx, item.id, { includeDeleted: true });
 }
 
 export async function restoreItem(ctx: MutationCtx, args: MutationArgsOf<'restoreItem'>): Promise<Row> {
@@ -357,13 +358,13 @@ export async function moveItem(ctx: MutationCtx, args: MutationArgsOf<'moveItem'
   assertCan(actor, 'item.create', { project: projectCtx(target) });
   if (target.id === item.project_id) return itemSnapshot(tx, item.id);
   if (target.allowed_type_ids && !target.allowed_type_ids.includes(item.type_id)) throw validation(`item type is not allowed in project ${target.key}`);
-  const item_seq = (await tx`update projects set item_seq = item_seq + 1 where id = ${target.id} returning item_seq`)[0]!.item_seq as number;
+  const item_seq = Number((await tx`update projects set item_seq = item_seq + 1 where id = ${target.id} returning item_seq`)[0]!.item_seq);
   const newKey = `${target.key}-${item_seq}`;
   const [afterRow] = await tx`update work_items set project_id = ${target.id}, number = ${item_seq}, key = ${newKey} where id = ${item.id} returning *`;
   const after = stripSearch(afterRow!) as ItemRow;
   // project-scoped labels of the old project no longer apply
-  await tx`update work_item_labels wl set deleted_at = now() from labels l
-           where l.id = wl.label_id and wl.item_id = ${item.id} and wl.deleted_at is null and l.project_id = ${item.project_id}`;
+  await tx`update work_item_labels set deleted_at = ${nowIso()}
+           where item_id = ${item.id} and deleted_at is null and label_id in (select id from labels where project_id = ${item.project_id})`;
   await touchItemChildren(tx, item.id);
   await recordItemDiff(ctx, item, after, 'update');
   await ctx.emit([{ entity_type: 'work_item', entity_id: item.id, item_id: item.id, project_id: after.project_id, action: 'update', field: 'key', old_value: item.key, new_value: newKey }]);
@@ -388,9 +389,11 @@ export async function findLabel(ctx: MutationCtx, projectId: string, name: strin
 export async function findOrCreateLabel(ctx: MutationCtx, project: Row, name: string): Promise<Row> {
   const existing = await findLabel(ctx, project.id, name);
   if (existing) return existing;
-  const [l] = await ctx.tx`insert into labels (project_id, name) values (${project.id}, ${name}) returning *`;
-  await ctx.emit([{ entity_type: 'label', entity_id: l!.id, project_id: project.id, action: 'create', field: null, new_value: l }]);
-  return l!;
+  const id = randomUUID();
+  await ctx.tx`insert into labels (id, project_id, name) values (${id}, ${project.id}, ${name})`;
+  const l = await reload(ctx.tx, 'labels', id);
+  await ctx.emit([{ entity_type: 'label', entity_id: l.id, project_id: project.id, action: 'create', field: null, new_value: l }]);
+  return l;
 }
 
 async function attachLabel(ctx: MutationCtx, item: Row, labelId: string, opts: { record?: boolean } = {}) {
@@ -400,7 +403,7 @@ async function attachLabel(ctx: MutationCtx, item: Row, labelId: string, opts: {
   const beforeIds = opts.record ? await labelIdsOf(ctx.tx, item.id) : [];
   const res = await ctx.tx`
     insert into work_item_labels (item_id, label_id) values (${item.id}, ${labelId})
-    on conflict (item_id, label_id) do update set deleted_at = null where work_item_labels.deleted_at is not null
+    on conflict (item_id, label_id) do update set deleted_at = null where deleted_at is not null
     returning item_id`;
   if (res.length && opts.record) {
     await touchItem(ctx.tx, item.id);
@@ -410,7 +413,7 @@ async function attachLabel(ctx: MutationCtx, item: Row, labelId: string, opts: {
 
 async function detachLabel(ctx: MutationCtx, item: Row, labelId: string) {
   const beforeIds = await labelIdsOf(ctx.tx, item.id);
-  const res = await ctx.tx`update work_item_labels set deleted_at = now() where item_id = ${item.id} and label_id = ${labelId} and deleted_at is null returning item_id`;
+  const res = await ctx.tx`update work_item_labels set deleted_at = ${nowIso()} where item_id = ${item.id} and label_id = ${labelId} and deleted_at is null returning item_id`;
   if (res.length) {
     await touchItem(ctx.tx, item.id);
     await ctx.emit([{ entity_type: 'work_item', entity_id: item.id, item_id: item.id, project_id: item.project_id, action: 'update', field: 'labels', old_value: beforeIds, new_value: beforeIds.filter((x) => x !== labelId) }]);
@@ -438,12 +441,14 @@ export async function createLabel(ctx: MutationCtx, args: MutationArgsOf<'create
   } else if (ctx.actor.firmRole === 'guest') {
     throw new ApiError(403, 'forbidden', 'guests cannot create firm-wide labels');
   }
+  // `is` is SQLite's null-safe equality (Postgres: is not distinct from)
   const [existing] = await ctx.tx`
-    select * from labels where lower(name) = lower(${args.name}) and project_id is not distinct from ${args.project_id} and deleted_at is null`;
+    select * from labels where lower(name) = lower(${args.name}) and project_id is ${args.project_id} and deleted_at is null`;
   if (existing) return existing;
-  const [l] = await ctx.tx`insert into labels (id, project_id, name, color) values (${args.id}, ${args.project_id}, ${args.name}, ${args.color ?? null}) returning *`;
-  await ctx.emit([{ entity_type: 'label', entity_id: l!.id, project_id: args.project_id, action: 'create', field: null, new_value: l }]);
-  return l!;
+  await ctx.tx`insert into labels (id, project_id, name, color) values (${args.id}, ${args.project_id}, ${args.name}, ${args.color ?? null})`;
+  const l = await reload(ctx.tx, 'labels', args.id);
+  await ctx.emit([{ entity_type: 'label', entity_id: l.id, project_id: args.project_id, action: 'create', field: null, new_value: l }]);
+  return l;
 }
 
 /** Can the actor see the item at all (used by routes before 404-ing). */

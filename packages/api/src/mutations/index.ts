@@ -52,7 +52,7 @@ const handlers: { [N in MutationName]: Handler<N> } = {
 };
 
 /**
- * THE write path. Runs inside a transaction that already holds the sync advisory lock.
+ * THE write path. Runs inside a write transaction (BEGIN IMMEDIATE; writers are serialised).
  * Checks permissions, validates, writes rows + activity events, maintains watchers,
  * produces notifications, enqueues webhooks and flags sync resyncs.
  */
@@ -69,13 +69,15 @@ export async function applyMutation(tx: Tx, actor: Actor, mutation: Mutation, me
 
 async function applyResyncFlags(ctx: MutationCtx) {
   if (ctx.resyncUsers === 'all') {
-    await ctx.tx`update sync_client_groups set resync_required = true where not resync_required`;
+    await ctx.tx`update sync_client_groups set resync_required = 1 where resync_required = 0`;
     return;
   }
   if (ctx.resyncUsers.size) {
-    await ctx.tx`update sync_client_groups set resync_required = true where user_id = any(${[...ctx.resyncUsers]}::uuid[]) and not resync_required`;
+    await ctx.tx`update sync_client_groups set resync_required = 1 where user_id in ${ctx.tx([...ctx.resyncUsers])} and resync_required = 0`;
   }
   for (const pid of ctx.resyncProjects) {
-    await ctx.tx`update sync_client_groups g set resync_required = true where not resync_required and effective_project_role(g.user_id, ${pid}) is not null`;
+    await ctx.tx`
+      update sync_client_groups set resync_required = 1
+      where resync_required = 0 and user_id in (select er.user_id from effective_roles er where er.project_id = ${pid})`;
   }
 }
