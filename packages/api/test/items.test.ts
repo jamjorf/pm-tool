@@ -295,6 +295,8 @@ describe('items', () => {
     expect(hit.rank).toBeGreaterThan(0);
     expect(hit.snippet).toContain('**Zebra**');
     expect(hit.label_ids).toEqual([]);
+    expect(new Set(word.items.map((i: any) => i.id)).size).toBe(word.items.length); // one row per item (FTS index is not duplicated)
+    expect((await app.db`select count(*) as n from work_items_fts where id = ${item.id}`)[0]!.n).toBe(1);
     const partial = expectOk(await api.get('/api/v1/search?q=zebr'));
     const p = partial.items.find((i: any) => i.key === item.key);
     expect(p).toBeTruthy();
