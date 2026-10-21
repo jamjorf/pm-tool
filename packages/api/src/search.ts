@@ -6,7 +6,8 @@ export interface SearchOptions { projectId?: string | null; limit?: number }
 
 /**
  * Full-text search over work_items_v through the FTS5 index (work_items_fts: key, title, description),
- * ranked with bm25 (key and title weigh more) and a `**`-highlighted snippet; falls back to a
+ * ranked with bm25 (weights per column: id 0, key 10, title 5, description 1) and a `**`-highlighted
+ * snippet from the best-matching column; falls back to a
  * case-insensitive title/key substring match when FTS finds nothing. Always scoped by visible_items.
  * `rank` is exposed as a positive number (higher = better; bm25 itself is lower-is-better).
  */
@@ -21,7 +22,7 @@ export async function searchItems(q: Q, userId: string, query: string, opts: Sea
   if (match) {
     rows = await q`
       select w.*, -f.rank as rank, f.snippet as snippet
-      from (select f.id, bm25(f.work_items_fts, 10.0, 5.0, 1.0) as rank, snippet(f.work_items_fts, -1, '**', '**', '…', 12) as snippet
+      from (select f.id, bm25(f.work_items_fts, 0.0, 10.0, 5.0, 1.0) as rank, snippet(f.work_items_fts, -1, '**', '**', '…', 12) as snippet
             from work_items_fts f where f.work_items_fts match ${match}) f
       join work_items_v w on w.id = f.id
       where ${scope}

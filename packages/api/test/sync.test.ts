@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
-import { client, createProject, expectOk, login, startApp, typeIds, type Api, type Session } from './helpers.js';
+import { client, count, createProject, expectOk, login, startApp, typeIds, type Api, type Session } from './helpers.js';
 import { pokeBus } from '../src/sync/poke.js';
 
 let app: FastifyInstance;
@@ -42,15 +42,17 @@ describe('sync', () => {
     const res = await push(api, cg, mutations);
     expect(res.status).toBe(200);
     expect(pokes.length).toBe(1);
+    expect(pokes[0]).toBe(app.db.currentVersion()); // poke carries the global version
     pokeBus.off('poke', onPoke);
     const [row] = await app.db`select key, title, priority from work_items where id = ${itemId}`;
     expect(row).toMatchObject({ key: `${P}-1`, title: 'Synced item v2', priority: 1 });
-    const [cl] = await app.db`select last_mutation_id from sync_clients where id = 'c1'`;
+    const [cl] = await app.db`select last_mutation_id, version from sync_clients where id = 'c1'`;
     expect(cl!.last_mutation_id).toBe(2);
-    const before = (await app.db`select count(*)::int as n from activity_events where item_id = ${itemId}`)[0]!.n;
+    expect(cl!.version).toBe(app.db.currentVersion()); // the last thing stamped in the push transaction
+    const before = await count(app, app.db`select count(*) as n from activity_events where item_id = ${itemId}`);
     const replay = await push(api, cg, mutations);
     expect(replay.status).toBe(200);
-    expect((await app.db`select count(*)::int as n from activity_events where item_id = ${itemId}`)[0]!.n).toBe(before);
+    expect(await count(app, app.db`select count(*) as n from activity_events where item_id = ${itemId}`)).toBe(before);
     const gap = await push(api, cg, [{ id: 9, clientID: 'c1', name: 'updateItem', args: { id: itemId, patch: { priority: 2 } } }]);
     expect(gap.status).toBe(409);
     const other = await push(viewerApi, cg, []);
@@ -70,9 +72,16 @@ describe('sync', () => {
     expect(keys.some((k: string) => k.startsWith('item_types/'))).toBe(true);
     expect(full.body.patch.filter((p: any) => p.op === 'del')).toHaveLength(0);
     const itemPut = full.body.patch.find((p: any) => p.key === `work_items/${itemId}`);
-    expect(itemPut.value).toMatchObject({ key: `${P}-1`, label_ids: [], parent_id: null, is_blocked: false });
+    expect(itemPut.value).toMatchObject({ key: `${P}-1`, label_ids: [], parent_id: null, is_blocked: false, confidential: false, fields: {} });
     expect(itemPut.value.search).toBeUndefined();
+    expect(itemPut.value._visible).toBeUndefined();
+    const typePut = full.body.patch.find((p: any) => p.key === `item_types/${types.bug}`);
+    expect(Array.isArray(typePut.value.field_defs)).toBe(true);
+    expect(typePut.value.is_active).toBe(true);
+    const statePut = full.body.patch.find((p: any) => p.key && p.key.startsWith('workflow_states/'));
+    expect(typeof statePut.value.is_initial).toBe('boolean');
     expect(typeof full.body.cookie).toBe('number');
+    expect(full.body.cookie).toBe(app.db.currentVersion()); // cookie = sync_state.version inside the snapshot
     cookie = full.body.cookie;
 
     const nothing = await pull(api, cg, cookie);
@@ -85,6 +94,7 @@ describe('sync', () => {
     const put = inc.body.patch.find((p: any) => p.key === `work_items/${itemId}`);
     expect(put.op).toBe('put');
     expect(put.value.title).toBe('v3');
+    expect(put.value.version).toBeGreaterThan(cookie);
     expect(inc.body.lastMutationIDChanges).toEqual({ c1: 3 });
     expect(inc.body.cookie).toBeGreaterThan(cookie);
     cookie = inc.body.cookie;
@@ -94,7 +104,9 @@ describe('sync', () => {
     expect(del.body.patch.find((p: any) => p.key === `work_items/${itemId}`)).toEqual({ op: 'del', key: `work_items/${itemId}` });
     cookie = del.body.cookie;
     await push(api, cg, [{ id: 5, clientID: 'c1', name: 'restoreItem', args: { id: itemId } }]);
-    cookie = (await pull(api, cg, cookie)).body.cookie;
+    const restored = await pull(api, cg, cookie);
+    expect(restored.body.patch.find((p: any) => p.key === `work_items/${itemId}`)?.op).toBe('put');
+    cookie = restored.body.cookie;
   });
 
   it('confidential items are hidden from users who are not assignee/reporter/admin; confidentiality changes force a resync', async () => {

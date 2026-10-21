@@ -12,7 +12,7 @@ function parseCookie(c: PullRequest['cookie']): number {
   return 0;
 }
 
-type Loader = (tx: Tx, userId: string, minVersion: number) => Promise<Row[]>;
+type Loader = (tx: Tx, userId: string, minVersion: number) => PromiseLike<Row[]>;
 
 /** Per-table loaders: every row with version > minVersion plus a `_visible` flag (0/1) for this user. */
 const LOADERS: Record<SyncedTable, Loader> = {

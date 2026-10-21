@@ -19,6 +19,7 @@
 //     other request while it is open
 // ============================================================================
 import { openDb, isUuid, nowIso, sqliteErrorKind, type Sql as DbSql, type Row as DbRow, type Fragment } from '@pm/db/sqlite';
+import { ftsQuery } from '@pm/core';
 
 export type Sql = DbSql;
 /** Transaction handle (same interface; statements issued inside `begin()` run in the transaction). */
@@ -67,11 +68,10 @@ export const dateIn = (days: number): string => new Date(Date.now() + days * 86_
 export const escapeLike = (s: string): string => s.replace(/[\\%_]/g, (c) => '\\' + c);
 
 /**
- * Build a safe FTS5 MATCH string from free text: each whitespace-separated token is quoted
- * (so punctuation / operators in user input cannot break the query). null when there is no token.
+ * Safe FTS5 MATCH string from free text (same builder as the QuerySpec `search` op in @pm/core:
+ * every whitespace-separated token becomes a quoted phrase, so user punctuation cannot break the
+ * query). null when there is no token.
  */
 export function ftsMatch(text: string): string | null {
-  const tokens = text.split(/\s+/).map((t) => t.replace(/"/g, '').trim()).filter(Boolean);
-  if (!tokens.length) return null;
-  return tokens.map((t) => `"${t}"`).join(' ');
+  return ftsQuery(text) || null;
 }

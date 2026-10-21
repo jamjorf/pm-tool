@@ -16,12 +16,15 @@ describe('health + auth', () => {
 
   it('dev-login creates the first user as owner, sets a cookie, /me works', async () => {
     const s = await login(app, 'owner@auth.test', 'Olivia Owner');
-    const [first] = await app.db`select firm_role from users where not is_service order by created_at limit 1`;
+    const [first] = await app.db`select firm_role from users where is_service = 0 order by created_at limit 1`;
     expect(first!.firm_role).toBe('owner'); // the very first user of the firm
-    expect(['owner', 'member']).toContain(s.user.firm_role);
+    expect(s.user.firm_role).toBe('owner');
+    expect(s.user.version).toBeGreaterThan(0); // stamped by the version trigger, re-read after insert
     const me = await client(app, s).get('/me');
     expect(me.status).toBe(200);
     expect(me.body.user.email).toBe('owner@auth.test');
+    expect(me.body.user.is_active).toBe(true);
+    expect(me.body.user.settings).toEqual({});
     expect(Array.isArray(me.body.memberships)).toBe(true);
     expect(Array.isArray(me.body.preferences)).toBe(true);
     const again = await login(app, 'owner@auth.test');
@@ -45,6 +48,7 @@ describe('health + auth', () => {
     const created = await api.post('/me/api-keys', { name: 'cli', scopes: ['read'] });
     expect(created.status).toBe(201);
     expect(created.body.key.startsWith('pm_')).toBe(true);
+    expect(created.body.scopes).toEqual(['read']); // JSON array column, hydrated
     const bearer = client(app, { headers: { authorization: `Bearer ${created.body.key}` } });
     const me = await bearer.get('/me');
     expect(me.status).toBe(200);
@@ -54,6 +58,7 @@ describe('health + auth', () => {
     const list = await api.get('/me/api-keys');
     expect(list.body.keys.map((k: any) => k.id)).toContain(created.body.id);
     expect(list.body.keys[0].key).toBeUndefined();
+    expect(list.body.keys[0].last_used_at).toBeTruthy();
     const bad = await client(app, { headers: { authorization: 'Bearer pm_nope' } }).get('/me');
     expect(bad.status).toBe(401);
     const out = await api.post('/auth/logout', {});

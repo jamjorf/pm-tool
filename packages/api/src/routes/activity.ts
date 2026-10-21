@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { requireAuth } from '../auth/plugin.js';
 import { isUuid } from '../db.js';
 import { validation } from '../errors.js';
-import { resolveItemId } from '../mutations/helpers.js';
+import { hasProjectRole, resolveItemId, visibleItem, visibleProjects } from '../mutations/helpers.js';
 import { actorOf, intQuery, projectIdQuery, queryOf } from './util.js';
 
 export async function activityRoutes(app: FastifyInstance) {
@@ -27,15 +27,15 @@ export async function activityRoutes(app: FastifyInstance) {
       left join users a on a.id = e.actor_id
       left join work_items w on w.id = e.item_id
       left join projects p on p.id = e.project_id
-      where (e.project_id is null or e.project_id in (select visible_project_ids(${u})))
-        and (e.item_id is null or can_view_item(${u}, e.item_id)
-             or exists (select 1 from work_items d where d.id = e.item_id and d.deleted_at is not null and not d.confidential and effective_project_role(${u}, d.project_id) is not null))
-        and (${projectId}::uuid is null or e.project_id = ${projectId}::uuid)
-        and (${itemId}::uuid is null or e.item_id = ${itemId}::uuid)
-        and (${actorId}::uuid is null or e.actor_id = ${actorId}::uuid)
-        and (${since}::bigint is null or e.id > ${since}::bigint)
-        and (${before}::bigint is null or e.id < ${before}::bigint)
-      order by e.id ${since !== null ? db`asc` : db`desc`}
+      where (e.project_id is null or e.project_id in ${visibleProjects(db, u)})
+        and (e.item_id is null or ${visibleItem(db, u, 'e.item_id')}
+             or exists (select 1 from work_items d where d.id = e.item_id and d.deleted_at is not null and d.confidential = 0 and ${hasProjectRole(db, u, 'd.project_id')}))
+        and (${projectId} is null or e.project_id = ${projectId})
+        and (${itemId} is null or e.item_id = ${itemId})
+        and (${actorId} is null or e.actor_id = ${actorId})
+        and (${since} is null or e.id > ${since})
+        and (${before} is null or e.id < ${before})
+      order by e.id ${since !== null ? db.raw('asc') : db.raw('desc')}
       limit ${limit}`;
     return { events, cursor: events.length ? (since !== null ? events.at(-1)!.id : events[0]!.id) : (since ?? null) };
   });
